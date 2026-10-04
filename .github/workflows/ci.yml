@@ -1,0 +1,154 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Rules and build (Node ${{ matrix.node }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22', '24']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - name: Rules and real Socket.IO integration tests
+        run: npm test
+      - name: TypeScript and production build
+        run: npm run build
+      - name: Audit production dependencies
+        if: matrix.node == '24'
+        run: npm audit --omit=dev --audit-level=high
+
+  browser:
+    name: Browser acceptance (Chromium)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      HOST: 127.0.0.1
+      PORT: '3001'
+      DATA_DIR: ${{ runner.temp }}/interlude-browser-rooms
+      GEMINI_API_KEY: ''
+      ALLOWED_ORIGINS: http://127.0.0.1:3001,http://127.0.0.1:5173
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: tests/requirements.txt
+      - run: npm ci
+      - run: npm run build
+      - run: python -m pip install -r tests/requirements.txt
+      - run: python -m playwright install --with-deps chromium
+      - name: Start the production server
+        run: |
+          mkdir -p test-results
+          npm start > test-results/server.log 2>&1 &
+          for attempt in {1..60}; do
+            if curl --fail --silent http://127.0.0.1:3001/api/health; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat test-results/server.log
+          exit 1
+      - name: Rooms, character cards and mobile layouts
+        run: python tests/e2e.py --url http://127.0.0.1:3001
+      - name: Allocation, host review and scenario constraints
+        run: python tests/e2e_review.py --url http://127.0.0.1:3001
+      - name: Personal libraries, source imports and responsive tools
+        run: python tests/e2e_toolkit.py --url http://127.0.0.1:3001
+      - name: D&D stat blocks and both encounter systems
+        run: python tests/e2e_encounter.py --url http://127.0.0.1:3001
+      - name: Start the source harness for native IndexedDB checks
+        run: |
+          npx vite --host 127.0.0.1 > test-results/vite.log 2>&1 &
+          for attempt in {1..60}; do
+            if curl --fail --silent --output /dev/null http://127.0.0.1:5173/src/keeper-storage.ts; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat test-results/vite.log
+          exit 1
+      - name: Native IndexedDB persistence, concurrency and rollback
+        run: python tests/e2e_keeper_storage.py --url http://127.0.0.1:5173
+      - name: Save acceptance reports, screenshots and server logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: browser-acceptance
+          path: test-results/
+          retention-days: 14
+          if-no-files-found: warn
+
+  container:
+    name: Docker build and startup
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build the production image
+        run: docker build --tag interlude:ci .
+      - name: Verify container health and bundled frontend
+        run: |
+          docker run --detach --name interlude-ci --publish 127.0.0.1:3001:3001 interlude:ci
+          for attempt in {1..60}; do
+            if curl --fail --silent http://127.0.0.1:3001/api/health; then
+              curl --fail --silent http://127.0.0.1:3001/ > /tmp/interlude-index.html
+              python3 - <<'PY'
+          from pathlib import Path
+          import json
+          import re
+          from urllib.request import urlopen
+          page = Path('/tmp/interlude-index.html').read_text()
+          assert '幕间' in page
+          scripts = re.findall(r'src="(/assets/[^\"]+\.js)"', page)
+          assert scripts, 'Production JavaScript bundle is missing'
+          for path in scripts:
+              with urlopen('http://127.0.0.1:3001' + path) as response:
+                  assert response.status == 200
+                  assert 'javascript' in response.headers['Content-Type']
+                  assert len(response.read()) > 0
+          with urlopen('http://127.0.0.1:3001/api/health') as response:
+              assert json.load(response)['ok'] is True
+          PY
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs interlude-ci
+          exit 1
+      - name: Container logs and cleanup
+        if: always()
+        run: |
+          docker logs interlude-ci || true
+          docker rm --force interlude-ci || true
