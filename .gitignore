@@ -1,0 +1,16 @@
+node_modules/
+dist/
+.env
+.env.local
+data/
+test-results/
+playwright-report/
+.DS_Store
+*.log
+.venv/
+__pycache__/
+
+# Local implementation notes
+task_plan.md
+progress.md
+findings.md

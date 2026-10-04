@@ -1,0 +1,12 @@
+node_modules
+dist
+.git
+.env*
+data
+test-results
+.venv
+*.log
+__pycache__
+task_plan.md
+progress.md
+findings.md

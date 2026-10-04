@@ -1,0 +1,18 @@
+services:
+  interlude:
+    build: .
+    init: true
+    restart: unless-stopped
+    ports:
+      - '127.0.0.1:3001:3001'
+    environment:
+      HOST: 0.0.0.0
+      PORT: 3001
+      DATA_DIR: /app/data
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.8-flash}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
+    volumes:
+      - room-data:/app/data
+volumes:
+  room-data:
