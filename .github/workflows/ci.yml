@@ -46,7 +46,7 @@ jobs:
     env:
       HOST: 127.0.0.1
       PORT: '3001'
-      DATA_DIR: ${{ runner.temp }}/interlude-browser-rooms
+      DATA_DIR: ./data/ci-browser-rooms
       GEMINI_API_KEY: ''
       ALLOWED_ORIGINS: http://127.0.0.1:3001,http://127.0.0.1:5173
     steps:
