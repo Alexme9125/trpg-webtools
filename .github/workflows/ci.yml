@@ -86,6 +86,10 @@ jobs:
         run: python tests/e2e_toolkit.py --url http://127.0.0.1:3001
       - name: D&D stat blocks and both encounter systems
         run: python tests/e2e_encounter.py --url http://127.0.0.1:3001
+      - name: In-session attributes, skills and temporary effects
+        run: python tests/e2e_adjustments.py --url http://127.0.0.1:3001
+      - name: CoC attribute caps, room constraints and saved drafts
+        run: python tests/e2e_coc_cap.py --url http://127.0.0.1:3001
       - name: Start the source harness for native IndexedDB checks
         run: |
           npx vite --host 127.0.0.1 > test-results/vite.log 2>&1 &

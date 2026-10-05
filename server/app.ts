@@ -26,6 +26,11 @@ import {
   validateEncounterReferences,
 } from '../shared/encounter.ts';
 import { KeeperCardSchema, getKeeperCardErrors } from '../shared/keeper.ts';
+import {
+  CharacterAdjustmentEditSchema,
+  applyCharacterAdjustment,
+  adjustmentDescription,
+} from '../shared/adjustments.ts';
 import { getCharacterErrors, rollCheck, rollDice, type DieRandom } from '../shared/rules.ts';
 import type {
   Ack,
@@ -149,6 +154,15 @@ function migrateSaved(raw: unknown): unknown {
 }
 const actionSchema = z.discriminatedUnion('type', [
   ...EncounterActionSchemas,
+  z
+    .object({
+      type: z.literal('character-adjust'),
+      memberId: id,
+      characterId: id,
+      expectedRevision: revision,
+      edit: CharacterAdjustmentEditSchema,
+    })
+    .strict(),
   z
     .object({ type: z.literal('dnd-save'), cards: z.array(DndStatBlockSchema).min(1).max(200) })
     .strict(),
@@ -769,6 +783,30 @@ export function createAppServer(options: ServerOptions = {}) {
         }
       };
       switch (action.type) {
+        case 'character-adjust': {
+          host();
+          requireCondition(
+            room.phase === 'active',
+            '局内调整在故事开始后使用；准备阶段请编辑角色卡并重新审核',
+          );
+          const character = target(action.memberId);
+          const selected = room.members.find((m) => m.id === action.memberId)!;
+          requireCondition(
+            character.id === action.characterId &&
+              selected.characterRevision === action.expectedRevision,
+            '角色状态已更新，请载入最新数值后再调整',
+          );
+          const updated = applyCharacterAdjustment(
+            character,
+            action.edit,
+            new Date(now()).toISOString(),
+          );
+          requireCondition(getCharacterErrors(updated).length === 0, '调整后的角色卡数值无效');
+          selected.character = updated;
+          characterChanged(selected.id);
+          addEvent(entry, 'system', member, adjustmentDescription(character, updated, action.edit));
+          break;
+        }
         case 'creation-policy':
           host();
           lobby();

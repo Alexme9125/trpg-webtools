@@ -28,6 +28,7 @@ import {
   type CombatantPatch,
 } from '../../shared/encounter';
 import { abilityModifier, proficiencyBonus } from '../../shared/rules';
+import { effectiveCharacter } from '../../shared/adjustments';
 import { DndBlockPreview } from './DndWorkshop';
 import { Spinner } from './ui';
 
@@ -874,7 +875,8 @@ function CombatantRolls({
   onApply: (patch: CombatantPatch) => Promise<boolean>;
   disabled: boolean;
 }) {
-  const memberCard = room.members.find((m) => m.id === c.memberId)?.character;
+  const rawMemberCard = room.members.find((m) => m.id === c.memberId)?.character;
+  const memberCard = rawMemberCard ? effectiveCharacter(rawMemberCard) : null;
   const sourceCon = c.source?.attributes.con;
   const defaultCon =
     c.source?.rule === 'dnd'
@@ -892,7 +894,8 @@ function CombatantRolls({
       ? (c.source.actions.find((a) => a.attackBonus !== null)?.attackBonus ?? null)
       : null,
   );
-  const [conModifier, setConModifier] = useState<number | null>(defaultCon);
+  const [conOverride, setConOverride] = useState<{ value: number | null } | null>(null);
+  const conModifier = conOverride ? conOverride.value : defaultCon;
   const [damage, setDamage] = useState(10);
   const [expression, setExpression] = useState('1d6');
   const [pending, setPending] = useState<{ id: string; kind: string } | null>(null);
@@ -1043,13 +1046,19 @@ function CombatantRolls({
               <label className="field">
                 体质豁免总加值
                 <input
+                  aria-label="体质豁免总加值"
                   type="number"
                   min={-100}
                   max={100}
                   placeholder="请填写"
                   value={conModifier ?? ''}
-                  onChange={(e) => setConModifier(nullable(e.target.value))}
+                  onChange={(e) => setConOverride({ value: nullable(e.target.value) })}
                 />
+                {conOverride && (
+                  <button className="text-button" onClick={() => setConOverride(null)}>
+                    使用角色最新加值
+                  </button>
+                )}
               </label>
             </div>
             <div className="combatant-inline">
@@ -1200,8 +1209,8 @@ function CocMelee({ room, run }: { room: Room; run: Run }) {
   const participants = room.encounter.participants;
   const [attackId, setAttackId] = useState('');
   const [defenseId, setDefenseId] = useState('');
-  const [attackSkill, setAttackSkill] = useState<number | null>(null);
-  const [defenseSkill, setDefenseSkill] = useState<number | null>(null);
+  const [attackOverride, setAttackOverride] = useState<{ value: number | null } | null>(null);
+  const [defenseOverride, setDefenseOverride] = useState<{ value: number | null } | null>(null);
   const [defense, setDefense] = useState<'dodge' | 'fight-back'>('dodge');
   const [attackEdge, setAttackEdge] = useState<Edge>('normal');
   const [defenseEdge, setDefenseEdge] = useState<Edge>('normal');
@@ -1212,9 +1221,10 @@ function CocMelee({ room, run }: { room: Room; run: Run }) {
   const latest = [...room.log]
     .reverse()
     .find((e) => e.type === 'system' && e.content.includes('（不自动扣除 HP）'));
-  const usePerson = (id: string, side: 'attack' | 'defense', response = defense) => {
+  const personSkill = (id: string, side: 'attack' | 'defense', response = defense) => {
     const c = participants.find((p) => p.id === id);
-    const pc = room.members.find((m) => m.id === c?.memberId)?.character;
+    const rawPc = room.members.find((m) => m.id === c?.memberId)?.character;
+    const pc = rawPc ? effectiveCharacter(rawPc) : null;
     const target =
       side === 'defense' && response === 'dodge'
         ? (pc?.skills.dodge ??
@@ -1224,12 +1234,17 @@ function CocMelee({ room, run }: { room: Room; run: Run }) {
         : c?.source?.rule === 'coc'
           ? (c.source.attacks[0]?.skill ?? null)
           : (pc?.skills.fightingBrawl ?? null);
+    return target;
+  };
+  const attackSkill = attackOverride ? attackOverride.value : personSkill(attackId, 'attack');
+  const defenseSkill = defenseOverride ? defenseOverride.value : personSkill(defenseId, 'defense');
+  const usePerson = (id: string, side: 'attack' | 'defense') => {
     if (side === 'attack') {
       setAttackId(id);
-      setAttackSkill(target);
+      setAttackOverride(null);
     } else {
       setDefenseId(id);
-      setDefenseSkill(target);
+      setDefenseOverride(null);
     }
   };
   const edgeSelect = (label: string, value: Edge, set: (value: Edge) => void) => (
@@ -1265,13 +1280,19 @@ function CocMelee({ room, run }: { room: Room; run: Run }) {
           <label className="field">
             进攻技能百分比
             <input
+              aria-label="进攻技能百分比"
               type="number"
               min={0}
               max={100000}
               placeholder="请填写"
               value={attackSkill ?? ''}
-              onChange={(e) => setAttackSkill(nullable(e.target.value))}
+              onChange={(e) => setAttackOverride({ value: nullable(e.target.value) })}
             />
+            {attackOverride && attackId && (
+              <button className="text-button" onClick={() => setAttackOverride(null)}>
+                使用角色当前进攻技能
+              </button>
+            )}
           </label>
           {edgeSelect('进攻骰', attackEdge, setAttackEdge)}
         </div>
@@ -1294,7 +1315,7 @@ function CocMelee({ room, run }: { room: Room; run: Run }) {
               onChange={(e) => {
                 const next = e.target.value as 'dodge' | 'fight-back';
                 setDefense(next);
-                if (defenseId) usePerson(defenseId, 'defense', next);
+                setDefenseOverride(null);
               }}
             >
               <option value="dodge">闪避</option>
@@ -1304,13 +1325,19 @@ function CocMelee({ room, run }: { room: Room; run: Run }) {
           <label className="field">
             防守技能百分比
             <input
+              aria-label="防守技能百分比"
               type="number"
               min={0}
               max={100000}
               placeholder="请填写"
               value={defenseSkill ?? ''}
-              onChange={(e) => setDefenseSkill(nullable(e.target.value))}
+              onChange={(e) => setDefenseOverride({ value: nullable(e.target.value) })}
             />
+            {defenseOverride && defenseId && (
+              <button className="text-button" onClick={() => setDefenseOverride(null)}>
+                使用角色当前防守技能
+              </button>
+            )}
           </label>
           {edgeSelect('防守骰', defenseEdge, setDefenseEdge)}
         </div>

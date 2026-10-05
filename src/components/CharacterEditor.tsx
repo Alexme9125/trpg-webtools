@@ -1,4 +1,4 @@
-import { useRef, useState, type FormEvent } from 'react';
+import { useMemo, useRef, useState, type FormEvent } from 'react';
 import {
   Check,
   Download,
@@ -12,11 +12,14 @@ import {
   Brain,
   WandSparkles,
   Info,
+  ArrowDownToLine,
+  LockKeyhole,
 } from 'lucide-react';
 import type { Character, RuleId } from '../../shared/types';
 import {
   createCharacter,
   rerollAttributes,
+  reduceCocAttributes,
   deriveCharacter,
   randomTraits,
   DND_ATTRIBUTES,
@@ -32,7 +35,15 @@ import {
   exportCharacter,
   parseCharacter,
 } from '../../shared/rules';
-import { downloadFile } from '../storage';
+import { downloadFile, readStored, writeStored } from '../storage';
+import {
+  cocAttributeCap,
+  cocAttributeRollError,
+  cocAttributeTotal,
+  scaleCocAttributes,
+} from '../../shared/coc-attributes';
+import { hasAdjustments } from '../../shared/adjustments';
+import { AdjustmentSummary } from './AdjustmentSummary';
 import {
   defaultCreationPolicy,
   defaultAllocation,
@@ -43,6 +54,22 @@ import { AllocationEditor } from './AllocationEditor';
 import { Modal, Spinner, DieIcon, ruleEdition } from './ui';
 
 type Section = 'identity' | 'attributes' | 'skills' | 'story';
+type RollLimitPreference = { enabled: boolean; max: string };
+const ROLL_LIMIT_STORAGE = 'interlude-coc-attribute-cap';
+function readRollLimit(): RollLimitPreference {
+  const stored = readStored<unknown>(ROLL_LIMIT_STORAGE, null);
+  if (stored && typeof stored === 'object' && 'enabled' in stored && 'max' in stored) {
+    const { enabled, max } = stored;
+    if (
+      typeof enabled === 'boolean' &&
+      typeof max === 'string' &&
+      !cocAttributeRollError({ maxTotal: Number(max) })
+    )
+      return { enabled, max };
+  }
+  return { enabled: false, max: '500' };
+}
+
 export function CharacterEditor({
   rule,
   initial,
@@ -58,17 +85,67 @@ export function CharacterEditor({
   inRoom?: boolean;
   policy?: CreationPolicy;
 }) {
-  const [card, setCard] = useState<Character>(() =>
-    initial ? structuredClone(initial) : createCharacter(rule),
+  const dnd = rule === 'dnd';
+  const [rollLimit, setRollLimit] = useState(readRollLimit);
+  const cocLimits = useMemo(() => {
+    if (dnd) return undefined;
+    const ranges = policy?.ranges.filter(
+      ({ field }) => field === 'attributeTotal' || field.startsWith('attributes.'),
+    );
+    return rollLimit.enabled || ranges?.length
+      ? { maxTotal: rollLimit.enabled ? Number(rollLimit.max) : undefined, ranges }
+      : undefined;
+  }, [dnd, rollLimit, policy]);
+  const rollLimitError = useMemo(
+    () => (cocLimits ? cocAttributeRollError(cocLimits) : null),
+    [cocLimits],
   );
-  const [section, setSection] = useState<Section>('identity');
+  const [draft] = useState(() => {
+    if (initial) return { card: structuredClone(initial), rolled: false, error: '' };
+    try {
+      return { card: createCharacter(rule, undefined, cocLimits), rolled: true, error: '' };
+    } catch (error) {
+      // Incompatible room ranges must not produce a random card outside those ranges.
+      // Keep a clearly marked manual draft so the user can still fill/import a card.
+      return {
+        card: createCharacter(rule, () => 1),
+        rolled: false,
+        error: `${(error as Error).message} 当前为手填底稿，尚未生成骰点。`,
+      };
+    }
+  });
+  const [card, setCard] = useState<Character>(draft.card);
+  const [section, setSection] = useState<Section>(draft.error ? 'attributes' : 'identity');
   const [errors, setErrors] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
-  const [rollCount, setRollCount] = useState(1);
+  const [rollCount, setRollCount] = useState(draft.rolled ? 1 : 0);
+  const [rollError, setRollError] = useState(draft.error);
+  const [attributeNotice, setAttributeNotice] = useState('');
+  const [manualDraft, setManualDraft] = useState(!!draft.error);
   const [rolled, setRolled] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
-  const dnd = rule === 'dnd';
   const attrs = dnd ? DND_ATTRIBUTES : COC_ATTRIBUTES;
+  const hostTotalRange = policy?.ranges.find(({ field }) => field === 'attributeTotal');
+  const attributeTotal = dnd ? 0 : cocAttributeTotal(card.attributes);
+  const effectiveCap = cocLimits ? cocAttributeCap(cocLimits) : undefined;
+  const overCap = effectiveCap !== undefined && attributeTotal > effectiveCap;
+  const reduction = useMemo(() => {
+    if (!overCap || !cocLimits) return null;
+    try {
+      return { attributes: scaleCocAttributes(card.attributes, cocLimits), error: '' };
+    } catch (error) {
+      return { attributes: null, error: (error as Error).message };
+    }
+  }, [overCap, cocLimits, card.attributes]);
+  const changeRollLimit = (next: RollLimitPreference) => {
+    if (hostTotalRange) return;
+    setRollLimit(next);
+    setRollError('');
+    setAttributeNotice('');
+    if (!cocAttributeRollError({ maxTotal: Number(next.max) }))
+      writeStored(ROLL_LIMIT_STORAGE, next);
+    else if (!next.enabled) writeStored(ROLL_LIMIT_STORAGE, { enabled: false, max: '500' });
+  };
   const patch = (values: Partial<Character>) =>
     setCard((c) =>
       deriveCharacter(
@@ -85,7 +162,8 @@ export function CharacterEditor({
         }),
       ),
     );
-  const setAttribute = (key: string, value: number) =>
+  const setAttribute = (key: string, value: number) => {
+    setAttributeNotice('');
     setCard((c) =>
       deriveCharacter(
         syncAllocation({
@@ -97,11 +175,34 @@ export function CharacterEditor({
         }),
       ),
     );
+  };
+  const reduceAttributes = () => {
+    if (!cocLimits) return;
+    try {
+      const next = reduceCocAttributes(card, cocLimits);
+      setCard(next);
+      setRollError('');
+      setManualDraft(false);
+      setAttributeNotice(
+        `已按比例降低：${attributeTotal} → ${cocAttributeTotal(next.attributes)}。基础技能与资源上限已同步，请复核职业点和兴趣点分配。`,
+      );
+    } catch (error) {
+      setRollError((error as Error).message);
+    }
+  };
   const randomize = () => {
-    setCard((c) => rerollAttributes(c));
-    setRollCount((v) => v + 1);
-    setRolled(true);
-    setTimeout(() => setRolled(false), 450);
+    try {
+      const next = rerollAttributes(card, undefined, cocLimits);
+      setCard(next);
+      setRollError('');
+      setAttributeNotice('');
+      setManualDraft(false);
+      setRollCount((v) => v + 1);
+      setRolled(true);
+      setTimeout(() => setRolled(false), 450);
+    } catch (error) {
+      setRollError((error as Error).message);
+    }
   };
   const save = async (e?: FormEvent) => {
     e?.preventDefault();
@@ -137,6 +238,10 @@ export function CharacterEditor({
     try {
       if (file.size > 256000) throw new Error('角色卡不能超过 256 KB。');
       setCard(parseCharacter(await file.text(), rule));
+      setRollCount(0);
+      setRollError('');
+      setAttributeNotice('');
+      setManualDraft(false);
       setErrors([]);
     } catch (e) {
       setErrors([(e as Error).message]);
@@ -233,6 +338,12 @@ export function CharacterEditor({
           />
         </aside>
         <div className="editor-main">
+          {hasAdjustments(card) && (
+            <details className="editor-adjustment-note">
+              <summary>这张卡带有局内修正 · 此页编辑制卡原始值</summary>
+              <AdjustmentSummary card={card} />
+            </details>
+          )}
           <div className="editor-tabs">
             {tabs.map(([key, label]) => (
               <button
@@ -381,10 +492,132 @@ export function CharacterEditor({
                       : '属性按 CoC 7 生成 · 年龄等修正请手动填写'}
                   </p>
                 </div>
-                <button className="button secondary" onClick={randomize}>
+                <button
+                  className="button secondary"
+                  onClick={randomize}
+                  disabled={!!rollLimitError}
+                >
                   <RefreshCw size={15} className={rolled ? 'spin' : ''} /> 重掷全部
                 </button>
               </div>
+              {!dnd && (
+                <div className="coc-attribute-cap">
+                  <div className="coc-cap-controls">
+                    <label className={`coc-cap-toggle ${hostTotalRange ? 'room-controlled' : ''}`}>
+                      <input
+                        type="checkbox"
+                        aria-label="启用属性点上限"
+                        checked={!!hostTotalRange || rollLimit.enabled}
+                        disabled={!!hostTotalRange}
+                        onChange={(event) =>
+                          changeRollLimit({ ...rollLimit, enabled: event.target.checked })
+                        }
+                      />
+                      <span>
+                        属性点上限
+                        <small>
+                          {hostTotalRange ? (
+                            <>
+                              <LockKeyhole size={11} /> 主持人规定 · 不含幸运
+                            </>
+                          ) : (
+                            '八项属性总和 · 不含幸运'
+                          )}
+                        </small>
+                      </span>
+                    </label>
+                    <label className="coc-cap-input">
+                      总和上限
+                      <input
+                        type="number"
+                        min={hostTotalRange ? undefined : 195}
+                        max={hostTotalRange ? undefined : 720}
+                        step={1}
+                        disabled={!hostTotalRange && !rollLimit.enabled}
+                        readOnly={!!hostTotalRange}
+                        value={hostTotalRange?.max ?? rollLimit.max}
+                        aria-invalid={!hostTotalRange && rollLimit.enabled && !!rollLimitError}
+                        aria-describedby="coc-cap-help"
+                        onChange={(event) =>
+                          changeRollLimit({ ...rollLimit, max: event.target.value })
+                        }
+                      />
+                    </label>
+                    <div className={`coc-cap-total ${overCap ? 'over-cap' : ''}`}>
+                      <span>当前总和</span>
+                      <output aria-label="八项属性总和">{attributeTotal}</output>
+                      <small>
+                        {effectiveCap !== undefined && !rollLimitError
+                          ? `上限 ${effectiveCap}`
+                          : '八项属性'}
+                      </small>
+                    </div>
+                  </div>
+                  <p id="coc-cap-help">
+                    {hostTotalRange
+                      ? '本房间直接采用主持人的上限，个人设置不影响本房间。超限卡片可按比例降低或重新掷骰。'
+                      : '启用后，新骰点不会超过上限。设置会在本机记住；手填和导入的数值保留。'}
+                  </p>
+                  {hostTotalRange && (
+                    <p className="coc-cap-room">
+                      主持人要求：总和 {hostTotalRange.min}–{hostTotalRange.max}
+                      ，调整范围需由主持人操作。
+                    </p>
+                  )}
+                  {policy?.ranges.some(({ field }) => field.startsWith('attributes.')) && (
+                    <p className="coc-cap-room">骰点同时遵守主持人设置的各项属性范围。</p>
+                  )}
+                  {rollLimitError || rollError ? (
+                    <p className="coc-cap-error" role="alert">
+                      {rollLimitError || rollError}
+                    </p>
+                  ) : (
+                    overCap && (
+                      <p className="coc-cap-error" role="status">
+                        当前总和超出上限 {attributeTotal - effectiveCap!} 点。
+                      </p>
+                    )
+                  )}
+                  {reduction && (
+                    <div className="coc-cap-resolution">
+                      <p>
+                        {reduction.attributes
+                          ? `按当前数值的 ${((effectiveCap! / attributeTotal) * 100).toFixed(1)}% 降低，逐项向下取整到 5 的倍数；总和将为 ${cocAttributeTotal(reduction.attributes)}，幸运保持不变。`
+                          : reduction.error}
+                      </p>
+                      <div className="coc-cap-actions">
+                        <button
+                          className="button secondary"
+                          onClick={reduceAttributes}
+                          disabled={!reduction.attributes}
+                        >
+                          <ArrowDownToLine size={15} />
+                          按比例降低
+                        </button>
+                        <button
+                          className="button secondary"
+                          onClick={randomize}
+                          disabled={!!rollLimitError}
+                        >
+                          <RefreshCw size={15} />
+                          重新掷骰
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                  {hostTotalRange && attributeTotal < hostTotalRange.min && (
+                    <p className="coc-cap-error" role="status">
+                      当前总和低于主持人下限 {hostTotalRange.min}，可重掷或手动调整。
+                    </p>
+                  )}
+                  {attributeNotice && (
+                    <p className="coc-cap-notice" role="status">
+                      {attributeNotice}
+                    </p>
+                  )}
+                  {manualDraft && <p className="coc-cap-error">当前为手填底稿，尚未生成骰点。</p>}
+                </div>
+              )}
               <div className={`attributes-grid ${rolled ? 'rerolling' : ''}`}>
                 {attrs.map((attr) => (
                   <label key={attr.key} className="attribute-box">
@@ -412,7 +645,7 @@ export function CharacterEditor({
                 <span className="field-tag random">
                   <Sparkles size={12} /> 随机生成 · 可手动修改
                 </span>
-                <span>第 {rollCount} 组 · 重掷不限次数</span>
+                <span>{rollCount > 0 ? `第 ${rollCount} 组` : '尚未重掷'} · 重掷不限次数</span>
               </div>
               <div className="section-divider" />
               <div className="editor-section-heading">

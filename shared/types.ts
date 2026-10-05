@@ -2,6 +2,7 @@ import type { CreationAllocation, CreationPolicy } from './creation';
 import type { KeeperCard } from './keeper';
 import type { DndStatBlock } from './dnd';
 import type { EncounterAction, EncounterState } from './encounter';
+import type { CharacterAdjustmentEdit, CharacterAdjustments } from './adjustments';
 export type RuleId = 'dnd' | 'coc';
 export type RoomMode = 'in-room' | 'external';
 export type Role = 'host' | 'player';
@@ -39,6 +40,7 @@ export interface Character {
   traits: string[];
   items: Item[];
   creation?: CreationAllocation;
+  adjustments?: CharacterAdjustments;
   createdAt: string;
   updatedAt: string;
 }
@@ -144,6 +146,13 @@ export interface JoinRoomInput {
 }
 export type RoomAction =
   | EncounterAction
+  | {
+      type: 'character-adjust';
+      memberId: string;
+      characterId: string;
+      expectedRevision: number;
+      edit: CharacterAdjustmentEdit;
+    }
   | { type: 'dnd-save'; cards: DndStatBlock[] }
   | { type: 'dnd-delete'; cardId: string }
   | { type: 'creation-policy'; policy: CreationPolicy; expectedRevision: number }

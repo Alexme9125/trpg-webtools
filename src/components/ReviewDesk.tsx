@@ -21,6 +21,7 @@ import {
 } from '../../shared/creation';
 import { Modal, Spinner } from './ui';
 import { ValidationSummary } from './AllocationEditor';
+import { AdjustmentSummary } from './AdjustmentSummary';
 
 export function ReviewDesk({
   room,
@@ -121,6 +122,7 @@ export function ReviewDesk({
                   <FileText size={28} strokeWidth={1} />
                 </div>
                 {member.character && <AuditCard card={member.character} />}
+                {member.character && <AdjustmentSummary card={member.character} />}
                 <ValidationSummary errors={errors} />
                 {member.review.note && (
                   <div className="review-note">
@@ -180,7 +182,7 @@ export function ReviewDesk({
 export function isApproved(member: Member, room: Room) {
   return (
     member.review.status === 'approved' &&
-    member.review.characterRevision === member.characterRevision &&
+    (room.phase === 'active' || member.review.characterRevision === member.characterRevision) &&
     member.review.policyRevision === room.policyRevision
   );
 }
