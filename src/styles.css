@@ -1908,6 +1908,26 @@ h1 > span {
   gap: 10px;
   flex-shrink: 0;
 }
+.room-immersive-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 36px;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.room-immersive-toggle:hover,
+.room-immersive-toggle[aria-pressed='true'] {
+  background: var(--subtle);
+  color: var(--green);
+  border-color: color-mix(in srgb, var(--green) 35%, var(--line));
+}
 .room-code {
   display: flex;
   align-items: center;
@@ -2185,6 +2205,15 @@ h1 > span {
   flex-direction: column;
   gap: 19px;
   min-width: 0;
+}
+.room-immersive .table-column {
+  gap: 12px;
+}
+.session-strip .table-bottom {
+  border-top: 0;
+}
+.room-immersive .story-scroll {
+  height: clamp(420px, calc(100dvh - 360px), 900px);
 }
 .table-panel {
   background: radial-gradient(
@@ -3871,6 +3900,13 @@ h1 > span {
   }
   .room-heading-actions > .room-code {
     margin-right: auto;
+  }
+  .room-heading-actions > .room-code > span {
+    display: none;
+  }
+  .room-immersive-toggle {
+    font-size: 11px;
+    padding-inline: 8px;
   }
   .room-code > b {
     font-size: 14px;
