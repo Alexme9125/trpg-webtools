@@ -64,12 +64,15 @@ import {
   proficiencyBonus,
 } from '../../shared/rules';
 import { getInspiration } from '../api';
-import { validateCreation, dndSkillModifier } from '../../shared/creation';
+import { validateCreation } from '../../shared/creation';
+import { adjustmentFields, effectiveCharacter, hasAdjustments } from '../../shared/adjustments';
+import { AdjustmentSummary } from './AdjustmentSummary';
 import { ReviewDesk, isApproved, reviewLabel } from './ReviewDesk';
 import { ValidationSummary } from './AllocationEditor';
 import { downloadFile } from '../storage';
 import { DieIcon, Modal, Spinner, hostName, ruleEdition } from './ui';
 const EncounterPanel = lazy(() => import('./EncounterPanel'));
+const CharacterAdjustments = lazy(() => import('./CharacterAdjustments'));
 
 interface Props {
   room: Room;
@@ -103,6 +106,7 @@ export function RoomView({
   const [showHost, setShowHost] = useState(false);
   const [showEncounter, setShowEncounter] = useState(false);
   const [showReview, setShowReview] = useState(false);
+  const [adjustMember, setAdjustMember] = useState<string | null>(null);
   const [showInspiration, setShowInspiration] = useState(false);
   const [leave, setLeave] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -457,43 +461,56 @@ export function RoomView({
             {tool === 'check' && <CheckTool room={room} me={me} run={run} />}
             {tool === 'inventory' && <InventoryTool room={room} me={me} run={run} />}
           </div>
-          {isHost && (
-            <div className="host-tool-links">
-              <button onClick={() => setShowReview(true)}>
-                <ClipboardCheck size={18} />
-                <span>
-                  审核与制卡要求<small>分配核对、剧本范围与审核意见</small>
-                </span>
-                <ChevronRight size={16} />
-              </button>
-              <button onClick={onHostToolkit}>
-                <BookOpen size={18} />
-                <span>
-                  主持人工具集<small>个人备团库、NPC／怪物与剧本导入</small>
-                </span>
-                <ChevronRight size={16} />
-              </button>
-
-              <button aria-label="场景与回合" onClick={() => setShowHost(true)}>
-                <SlidersHorizontal size={18} />
-                <span>
-                  场景与回合<small>场景、演出方式与战斗记录</small>
-                </span>
-                <ChevronRight size={16} />
-              </button>
-              {room.mode === 'in-room' && (
-                <button className="inspiration-link" onClick={() => setShowInspiration(true)}>
-                  <Sparkles size={19} />
+          <div className="host-tool-links">
+            <button
+              aria-label={isHost ? '角色调整' : '角色数值'}
+              onClick={() => setAdjustMember(isHost ? '' : me.id)}
+            >
+              <SlidersHorizontal size={18} />
+              <span>
+                {isHost ? '角色调整' : '角色数值'}
+                <small>
+                  {isHost ? '选择角色，调整属性、技能与临时效果' : '当前属性、技能与生效中的修正'}
+                </small>
+              </span>
+              <ChevronRight size={16} />
+            </button>
+            {isHost && (
+              <>
+                <button onClick={() => setShowReview(true)}>
+                  <ClipboardCheck size={18} />
                   <span>
-                    灵感小窗<small>故事卡住时，一点新的可能</small>
+                    审核与制卡要求<small>分配核对、剧本范围与审核意见</small>
                   </span>
-                  <ArrowUpRight size={16} />
+                  <ChevronRight size={16} />
                 </button>
-              )}
-            </div>
-          )}
-          {!isHost && (
-            <div className="host-tool-links">
+                <button onClick={onHostToolkit}>
+                  <BookOpen size={18} />
+                  <span>
+                    主持人工具集<small>个人备团库、NPC／怪物与剧本导入</small>
+                  </span>
+                  <ChevronRight size={16} />
+                </button>
+
+                <button aria-label="场景与回合" onClick={() => setShowHost(true)}>
+                  <SlidersHorizontal size={18} />
+                  <span>
+                    场景与回合<small>场景、演出方式与战斗记录</small>
+                  </span>
+                  <ChevronRight size={16} />
+                </button>
+                {room.mode === 'in-room' && (
+                  <button className="inspiration-link" onClick={() => setShowInspiration(true)}>
+                    <Sparkles size={19} />
+                    <span>
+                      灵感小窗<small>故事卡住时，一点新的可能</small>
+                    </span>
+                    <ArrowUpRight size={16} />
+                  </button>
+                )}
+              </>
+            )}
+            {!isHost && (
               <button aria-label="本场战斗" onClick={() => setShowEncounter(true)}>
                 <Shield size={18} />
                 <span>
@@ -501,8 +518,8 @@ export function RoomView({
                 </span>
                 <ChevronRight size={16} />
               </button>
-            </div>
-          )}
+            )}
+          </div>
           <div className="tool-tip">
             <DieIcon size={20} />
             <span>
@@ -570,7 +587,28 @@ export function RoomView({
           room={room}
           onClose={() => setSelectedMember(null)}
           run={run}
+          onAdjust={() => {
+            setSelectedMember(null);
+            setAdjustMember(focused.id);
+          }}
         />
+      )}
+      {adjustMember !== null && (
+        <Suspense
+          fallback={
+            <Modal title="角色数值" onClose={() => setAdjustMember(null)}>
+              <Spinner />
+            </Modal>
+          }
+        >
+          <CharacterAdjustments
+            room={room}
+            isHost={isHost}
+            initialMemberId={adjustMember || undefined}
+            run={run}
+            onClose={() => setAdjustMember(null)}
+          />
+        </Suspense>
       )}
       {showHost && isHost && (
         <HostTools
@@ -1081,16 +1119,24 @@ function CheckTool({ room, me, run }: { room: Room; me: Member; run: Run }) {
   const [edge, setEdge] = useState<Edge>('normal');
   const [visibility, setVisibility] = useState<Visibility>('public');
   const [busy, setBusy] = useState(false);
+  const card = me.role === 'host' || !me.character ? null : effectiveCharacter(me.character);
   const options =
-    kind === 'skill' ? (dnd ? DND_SKILLS : COC_SKILLS) : dnd ? DND_ATTRIBUTES : COC_ATTRIBUTES;
-  const card = me.role === 'host' ? null : me.character;
+    kind === 'skill'
+      ? card
+        ? adjustmentFields(card, 'skill')
+        : dnd
+          ? DND_SKILLS
+          : COC_SKILLS
+      : dnd
+        ? DND_ATTRIBUTES
+        : COC_ATTRIBUTES;
   let preview = modifier;
   if (dnd && card && kind !== 'attack') {
     const attr =
       kind === 'skill' ? (DND_SKILLS.find((s) => s.key === key)?.attribute ?? 'wis') : key;
     preview +=
       kind === 'skill'
-        ? dndSkillModifier(card, key)
+        ? card.skills[key]
         : abilityModifier(card.attributes[attr] ?? 10) +
           (kind === 'save' && card.proficiencies.includes(`save:${key}`)
             ? proficiencyBonus(card.level)
@@ -1134,7 +1180,11 @@ function CheckTool({ room, me, run }: { room: Room; me: Member; run: Run }) {
       {kind !== 'attack' && kind !== 'sanity' && (
         <label className="field">
           {kind === 'skill' ? '选择技能' : '选择属性'}
-          <select value={key} onChange={(e) => setKey(e.target.value)}>
+          <select
+            aria-label={kind === 'skill' ? '选择技能' : '选择属性'}
+            value={key}
+            onChange={(e) => setKey(e.target.value)}
+          >
             {options.map((option) => (
               <option key={option.key} value={option.key}>
                 {option.label}
@@ -1250,7 +1300,7 @@ function CheckTool({ room, me, run }: { room: Room; me: Member; run: Run }) {
           : dnd
             ? kind === 'attack'
               ? '攻击加值请填写完整数值。自然 20 命中，自然 1 失手。'
-              : '自动计入角色属性与熟练。普通属性、技能和豁免没有自然 1 / 20 自动成败。'
+              : '自动计入角色属性、熟练与局内修正；临时加值栏仅填写本次额外加值。普通属性、技能和豁免没有自然 1 / 20 自动成败。'
             : kind === 'sanity'
               ? '普通理智检定只判断成功或失败，不使用奖励／惩罚骰。损失与后续状态由守密人裁定。'
               : '奖励／惩罚骰使用同一个个位骰。返回成功等级后，由守密人依情境裁定。'}
@@ -1415,14 +1465,16 @@ function MemberModal({
   room,
   onClose,
   run,
+  onAdjust,
 }: {
   member: Member;
   me: Member;
   room: Room;
   onClose: () => void;
   run: Run;
+  onAdjust: () => void;
 }) {
-  const card = member.character;
+  const card = member.character ? effectiveCharacter(member.character) : null;
   const canEdit = me.id === member.id || me.role === 'host';
   const [confirm, setConfirm] = useState<'kick' | 'transfer-host' | null>(null);
   return (
@@ -1447,7 +1499,7 @@ function MemberModal({
                 className="icon-button"
                 onClick={() =>
                   downloadFile(
-                    exportCharacter(card, 'json'),
+                    exportCharacter(member.character!, 'json'),
                     `${card.name}.json`,
                     'application/json',
                   )
@@ -1492,6 +1544,16 @@ function MemberModal({
                 </div>
               ))}
             </div>
+            {member.role === 'player' && (
+              <button className="button secondary member-adjust-button" onClick={onAdjust}>
+                <SlidersHorizontal size={17} />
+                {me.role === 'host' ? '调整属性与技能' : '查看技能与修正'}
+                <ChevronRight size={16} />
+              </button>
+            )}
+            {member.character && hasAdjustments(member.character) && (
+              <AdjustmentSummary card={member.character} />
+            )}
             <div className="detail-traits">
               {card.traits.map((trait, i) => (
                 <p key={i}>

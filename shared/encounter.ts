@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { DndStatBlockSchema, type DndStatBlock } from './dnd';
 import { KeeperCardSchema, type KeeperCard } from './keeper';
 import { rollDice, type DieRandom } from './rules';
+import { effectiveCharacter } from './adjustments';
 import type { CheckResult, Member, RuleId } from './types';
 
 const id = z.string().regex(/^[A-Za-z0-9_-]{1,80}$/);
@@ -267,7 +268,7 @@ export function syncEncounterPlayers(state: EncounterState, members: Member[]): 
   const ids = new Set(players.map((m) => m.id));
   const next = state.participants.filter((p) => p.memberId === null || ids.has(p.memberId));
   for (const member of players) {
-    const card = member.character!;
+    const card = effectiveCharacter(member.character!);
     const index = next.findIndex((p) => p.memberId === member.id);
     const previous = index >= 0 ? next[index] : undefined;
     const player: Combatant = {

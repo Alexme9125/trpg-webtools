@@ -1,11 +1,18 @@
 import { z } from 'zod';
 import type { Character, CheckRequest, CheckResult, DiceGroup, DiceResult, RuleId } from './types';
+import { CreationAllocationSchema, defaultAllocation, syncAllocation } from './creation';
 import {
-  CreationAllocationSchema,
-  defaultAllocation,
-  syncAllocation,
-  dndSkillModifier,
-} from './creation';
+  rollCocAttributes,
+  scaleCocAttributes,
+  type CocAttributeRollLimits,
+} from './coc-attributes';
+import {
+  CharacterAdjustmentsSchema,
+  adjustmentLabel,
+  effectiveCharacter,
+  getAdjustmentErrors,
+  hasAdjustments,
+} from './adjustments';
 
 /** An injectable die returns a whole number in the inclusive range 1..sides. */
 export type DieRandom = (sides: number) => number;
@@ -115,6 +122,7 @@ export function rollCheck(
   if (typeof request.key !== 'string' || request.key.length > 80) throw new Error('检定项目无效');
   integer(request.modifier, -100, 100, '临时修正');
   if (character && character.rule !== rule) throw new Error('人物卡与房间规则不匹配');
+  if (character) character = effectiveCharacter(character);
   if (rule === 'dnd') {
     if (request.kind === 'sanity') throw new Error('D&D 5e 没有内置理智检定');
     integer(request.dc, 0, 1000, '难度等级');
@@ -137,7 +145,7 @@ export function rollCheck(
       if (character) {
         modifier +=
           request.kind === 'skill'
-            ? dndSkillModifier(character, request.key)
+            ? character.skills[request.key]
             : abilityModifier(character.attributes[attribute.key]);
         const proficiency = `${request.kind}:${request.key}`;
         if (request.kind === 'save' && character.proficiencies.includes(proficiency))
@@ -247,6 +255,7 @@ const CharacterSchema = z
     skills: z.record(safeKey, whole(-100, 100)),
     proficiencies: z.array(string(80)).max(50),
     creation: CreationAllocationSchema.optional(),
+    adjustments: CharacterAdjustmentsSchema.optional(),
     hp: whole(0, 9999),
     maxHp: whole(1, 9999),
     mp: whole(0, 9999),
@@ -309,6 +318,7 @@ const CharacterSchema = z
     if (character.hp > character.maxHp) issue(['hp'], '当前 HP 不可超过上限');
     if (character.mp > character.maxMp) issue(['mp'], '当前 MP 不可超过上限');
     if (character.san > character.maxSan) issue(['san'], '当前 SAN 不可超过上限');
+    for (const error of getAdjustmentErrors(character)) issue(['adjustments'], error);
   });
 
 const FIELD_LABELS: Record<string, string> = {
@@ -321,6 +331,7 @@ const FIELD_LABELS: Record<string, string> = {
   attributes: '属性',
   skills: '技能',
   proficiencies: '熟练项',
+  adjustments: '局内修正',
   backstory: '人物经历',
   notes: '笔记',
   traits: '词条',
@@ -442,7 +453,12 @@ export function randomTraits(rule: RuleId): string[] {
   return TRAITS[rule].map((choices) => choices[secureDie(choices.length) - 1]);
 }
 
-function rolledAttributes(rule: RuleId, rng: DieRandom): Record<string, number> {
+function rolledAttributes(
+  rule: RuleId,
+  rng: DieRandom,
+  cocLimits?: CocAttributeRollLimits,
+): Record<string, number> {
+  if (rule === 'coc' && cocLimits) return rollCocAttributes(cocLimits, rng);
   const attributes = rule === 'dnd' ? DND_ATTRIBUTES : COC_ATTRIBUTES;
   return Object.fromEntries(
     attributes.map(({ key }) => {
@@ -487,10 +503,14 @@ export function deriveCharacter(character: Character): Character {
 }
 
 /** Blank manual identity fields are intentional; readiness requires filling them. */
-export function createCharacter(rule: RuleId, rng: DieRandom = secureDie): Character {
+export function createCharacter(
+  rule: RuleId,
+  rng: DieRandom = secureDie,
+  cocLimits?: CocAttributeRollLimits,
+): Character {
   requireRule(rule);
   const now = new Date().toISOString();
-  const attributes = rolledAttributes(rule, rng);
+  const attributes = rolledAttributes(rule, rng, cocLimits);
   const character: Character = {
     schemaVersion: 1,
     id: globalThis.crypto.randomUUID(),
@@ -540,10 +560,24 @@ export function createCharacter(rule: RuleId, rng: DieRandom = secureDie): Chara
   };
 }
 
+/** Like manual attribute edits: update derived values without healing or erasing allocations. */
+export function reduceCocAttributes(
+  character: Character,
+  limits: CocAttributeRollLimits,
+): Character {
+  if (character.rule !== 'coc') throw new Error('按比例降低仅适用于 CoC 调查员属性。');
+  const attributes = scaleCocAttributes(character.attributes, limits);
+  return deriveCharacter(syncAllocation({ ...character, attributes }));
+}
+
 /** Creation-time action: new base attributes, refilled HP/MP and initial SAN. */
-export function rerollAttributes(character: Character, rng: DieRandom = secureDie): Character {
+export function rerollAttributes(
+  character: Character,
+  rng: DieRandom = secureDie,
+  cocLimits?: CocAttributeRollLimits,
+): Character {
   requireRule(character.rule);
-  const attributes = rolledAttributes(character.rule, rng);
+  const attributes = rolledAttributes(character.rule, rng, cocLimits);
   const skills = { ...character.skills };
   if (character.rule === 'coc') {
     // Preserve allocated points above the old attribute-based skill minimums.
@@ -635,8 +669,13 @@ export function exportCharacter(character: Character, format: 'json' | 'md'): st
   if (format === 'json') return `${json}\n`;
   if (format !== 'md') throw new Error('只支持 JSON 或 Markdown 导出');
   const heading = valid.name.replace(/[\r\n]/g, ' ');
+  const effective = effectiveCharacter(valid);
+  const clean = (text: string) => text.replace(/[\r\n|`]/g, ' ');
+  const adjustments = hasAdjustments(valid)
+    ? `\n\n## 局内修正\n\n属性表保留制卡原始值。以下修正已经计入检定，临时效果需要主持人手动结束。\n\n${valid.adjustments!.permanent.map((entry) => `- 长期 · ${adjustmentLabel(valid, entry.target, entry.key)} ${entry.amount >= 0 ? '+' : ''}${entry.amount}${entry.reason ? ` · ${clean(entry.reason)}` : ''}`).join('\n')}\n${valid.adjustments!.temporary.map((effect) => `- 临时 · ${clean(effect.name)} · ${effect.enabled ? '生效中' : '已停用'} · ${effect.changes.map((entry) => `${adjustmentLabel(valid, entry.target, entry.key)} ${entry.amount >= 0 ? '+' : ''}${entry.amount}`).join('、')} · 结束条件：${clean(effect.endCondition) || '主持人手动结束'}`).join('\n')}\n\n当前生效属性：${(valid.rule === 'dnd' ? DND_ATTRIBUTES : COC_ATTRIBUTES).map(({ key, label }) => `${label} ${effective.attributes[key]}`).join(' · ')}`
+    : '';
   const rows = (valid.rule === 'dnd' ? DND_ATTRIBUTES : COC_ATTRIBUTES)
     .map(({ key, label }) => `| ${label} | ${valid.attributes[key]} |`)
     .join('\n');
-  return `# ${heading} · 人物卡\n\n规则：${valid.rule === 'dnd' ? 'D&D 5e (2014) · SRD 5.1' : 'Call of Cthulhu 7'}\n\n职业：${valid.occupation.replace(/[\r\n]/g, ' ')}\n\n| 属性 | 数值 |\n| --- | ---: |\n${rows}\n\nHP ${valid.hp}/${valid.maxHp}${valid.rule === 'coc' ? ` · MP ${valid.mp}/${valid.maxMp} · SAN ${valid.san}/${valid.maxSan}` : ` · AC ${valid.ac}`}\n\n## 可再次导入的数据\n\n下方 JSON 是完整、可移植的人物记录；上方摘要仅供阅读。重新导入时以 JSON 为准。\n\n\`\`\`json\n${json}\n\`\`\`\n`;
+  return `# ${heading} · 人物卡\n\n规则：${valid.rule === 'dnd' ? 'D&D 5e (2014) · SRD 5.1' : 'Call of Cthulhu 7'}\n\n职业：${valid.occupation.replace(/[\r\n]/g, ' ')}\n\n| 属性 | 数值 |\n| --- | ---: |\n${rows}\n\nHP ${valid.hp}/${valid.maxHp}${valid.rule === 'coc' ? ` · MP ${valid.mp}/${valid.maxMp} · SAN ${valid.san}/${valid.maxSan}` : ` · AC ${valid.ac}`}${adjustments}\n\n## 可再次导入的数据\n\n下方 JSON 是完整、可移植的人物记录；上方摘要仅供阅读。重新导入时以 JSON 为准。\n\n\`\`\`json\n${json}\n\`\`\`\n`;
 }
