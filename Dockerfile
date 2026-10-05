@@ -7,9 +7,9 @@ RUN npm run build
 
 FROM node:24-alpine AS runtime
 WORKDIR /app
-ENV NODE_ENV=production HOST=0.0.0.0 PORT=3001 DATA_DIR=/app/data
+ENV NODE_ENV=production HOST=0.0.0.0 PORT=3001 DATA_DIR=/app/data IMAGE_DIR=/app/images
 COPY package*.json ./
-RUN npm ci --omit=dev && mkdir -p /app/data && chown -R node:node /app
+RUN npm ci --omit=dev && mkdir -p /app/data /app/images && chown -R node:node /app
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/server ./server
 COPY --from=build /app/shared ./shared

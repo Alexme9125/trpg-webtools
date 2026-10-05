@@ -1,3 +1,4 @@
+import { writeStored } from './storage';
 import { io } from 'socket.io-client';
 import type {
   Ack,
@@ -71,3 +72,101 @@ export const getInspiration = (session: Session, prompt: string) =>
     headers: { 'content-type': 'application/json', authorization: `Bearer ${session.token}` },
     body: JSON.stringify({ roomCode: session.roomCode, memberId: session.memberId, prompt }),
   });
+
+export async function uploadChatImage(
+  session: Session,
+  file: File,
+  content: string,
+  requestId: string,
+) {
+  const dataUrl = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('图片读取失败，请重新选择文件。'));
+    reader.onload = () => resolve(String(reader.result));
+    reader.readAsDataURL(file);
+  });
+  return jsonRequest<{ eventId: string }>(`/api/rooms/${session.roomCode}/images`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: `Bearer ${session.token}`,
+      'x-interlude-member': session.memberId,
+    },
+    body: JSON.stringify({
+      name: file.name.slice(0, 160) || '图片',
+      mime: file.type,
+      data: dataUrl.slice(dataUrl.indexOf(',') + 1),
+      content,
+      requestId,
+    }),
+  });
+}
+export class ImageUnavailableError extends Error {}
+export async function fetchChatImage(session: Session, imageId: string, signal: AbortSignal) {
+  const response = await fetch(`/api/rooms/${session.roomCode}/images/${imageId}`, {
+    headers: { authorization: `Bearer ${session.token}`, 'x-interlude-member': session.memberId },
+    signal,
+  });
+  if (response.status === 404 || response.status === 410)
+    throw new ImageUnavailableError('图片已过期或不可用');
+  if (!response.ok) throw new Error('图片暂时无法读取，请重试。');
+  return response.blob();
+}
+
+const sessionHeaders = (session: Session) => ({
+  authorization: `Bearer ${session.token}`,
+  'x-interlude-member': session.memberId,
+});
+export const prepareArchive = (session: Session) =>
+  jsonRequest<import('../shared/archive').ArchivePreparation>(
+    `/api/rooms/${session.roomCode}/archive`,
+    { headers: sessionHeaders(session) },
+  );
+export async function downloadArchive(
+  session: Session,
+  descriptions: Record<string, string>,
+  includeImages = true,
+) {
+  const response = await fetch(`/api/rooms/${session.roomCode}/archive`, {
+    method: 'POST',
+    headers: { ...sessionHeaders(session), 'content-type': 'application/json' },
+    body: JSON.stringify({ descriptions, includeImages }),
+    signal: AbortSignal.timeout(120_000),
+  });
+  if (!response.ok)
+    throw new Error((await response.json().catch(() => null))?.error ?? '存档生成失败，请重试。');
+  return response.blob();
+}
+export const inspectArchive = (file: File) =>
+  jsonRequest<import('../shared/archive').ArchiveSummary>('/api/archives/inspect', {
+    method: 'POST',
+    headers: { 'content-type': 'application/zip' },
+    body: file,
+  });
+export async function restoreArchive(
+  file: File,
+  nickname: string,
+  rule: import('../shared/types').RuleId,
+) {
+  const result = await jsonRequest<RoomConnection>('/api/archives/restore', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/zip',
+      'x-interlude-nickname': encodeURIComponent(nickname),
+      'x-interlude-rule': rule,
+    },
+    body: file,
+  });
+  // Save the newly created session before reconnecting; a network interruption must not strand it.
+  writeStored('interlude-session', result.session);
+  return resumeRoom(result.session);
+}
+export const getHistory = (session: Session, before?: string) =>
+  jsonRequest<{
+    events: import('../shared/types').RoomEvent[];
+    before: string | null;
+    hasMore: boolean;
+  }>(
+    `/api/rooms/${session.roomCode}/history${before ? `?before=${encodeURIComponent(before)}` : ''}`,
+    { headers: sessionHeaders(session) },
+  );

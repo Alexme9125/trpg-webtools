@@ -373,6 +373,18 @@ function PolicyEditor({
               <label className="checkbox-label">
                 <input
                   type="checkbox"
+                  checked={p.allowInterestOnOccupation !== false}
+                  onChange={(e) => patch({ allowInterestOnOccupation: e.target.checked })}
+                />
+                允许兴趣点投入职业技能（含信用评级）
+              </label>
+              <p className="subtle-note">
+                关闭后专点专用：职业点用于职业技能，兴趣点只用于其他技能。已有投入需由玩家退回后重分配。
+              </p>
+
+              <label className="checkbox-label">
+                <input
+                  type="checkbox"
                   checked={p.requireAllPoints}
                   onChange={(e) => patch({ requireAllPoints: e.target.checked })}
                 />

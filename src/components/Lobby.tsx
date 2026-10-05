@@ -1,3 +1,8 @@
+import { MAX_ARCHIVE_BYTES, type ArchiveSummary } from '../../shared/archive';
+import { inspectArchive } from '../api';
+import { ArchiveSummaryView } from './ArchiveSummary';
+import { parseRoomConfig, MAX_ROOM_CONFIG_BYTES, type RoomConfig } from '../../shared/room-config';
+import { ConfigurationSummary } from './RoomConfiguration';
 import { useRef, useState, type FormEvent } from 'react';
 import {
   ArrowUpRight,
@@ -154,18 +159,25 @@ export function Gateway({
   rule,
   onBack,
   onCreate,
+  onRestore,
   onJoin,
 }: {
   rule: RuleId;
   onBack: () => void;
   onCreate: (input: CreateRoomInput) => Promise<void>;
+  onRestore: (file: File, nickname: string) => Promise<void>;
   onJoin: (input: JoinRoomInput) => Promise<void>;
 }) {
   const [tab, setTab] = useState<'create' | 'join'>('create');
   const [nickname, setNickname] = useState(readStored<string>('interlude-nickname', ''));
   const [name, setName] = useState('');
   const [code, setCode] = useState('');
+  const [seatCode, setSeatCode] = useState('');
+  const [archive, setArchive] = useState<{ file: File; summary: ArchiveSummary } | null>(null);
+  const archiveFile = useRef<HTMLInputElement>(null);
   const [mode, setMode] = useState<RoomMode>('in-room');
+  const [configuration, setConfiguration] = useState<RoomConfig | null>(null);
+  const configFile = useRef<HTMLInputElement>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   async function submit(e: FormEvent) {
@@ -174,9 +186,24 @@ export function Gateway({
     setBusy(true);
     try {
       writeStored('interlude-nickname', nickname.trim());
-      if (tab === 'create')
-        await onCreate({ name: name.trim(), nickname: nickname.trim(), rule, mode });
-      else await onJoin({ code: code.trim().toUpperCase(), nickname: nickname.trim(), rule });
+      if (tab === 'create' && archive) await onRestore(archive.file, nickname.trim());
+      else if (tab === 'create')
+        await onCreate({
+          name: name.trim(),
+          nickname: nickname.trim(),
+          rule,
+          mode,
+          ...(configuration
+            ? { configuration: { ...configuration, name: name.trim(), mode } }
+            : {}),
+        });
+      else
+        await onJoin({
+          code: code.trim().toUpperCase(),
+          nickname: nickname.trim(),
+          rule,
+          ...(seatCode ? { seatCode } : {}),
+        });
     } catch (e) {
       setError(e instanceof Error ? e.message : '连接失败，请稍后重试。');
     } finally {
@@ -245,45 +272,160 @@ export function Gateway({
             </label>
             {tab === 'create' ? (
               <>
+                <div className="gateway-archive">
+                  <button
+                    className="button secondary full compact"
+                    type="button"
+                    disabled={busy}
+                    onClick={() => archiveFile.current?.click()}
+                  >
+                    <Upload size={16} /> 从全局存档续团
+                  </button>
+                  <input
+                    ref={archiveFile}
+                    className="visually-hidden"
+                    type="file"
+                    accept=".zip"
+                    aria-label="全局存档文件"
+                    onChange={async (e) => {
+                      const file = e.target.files?.[0];
+                      if (!file) return;
+                      setBusy(true);
+                      setError('');
+                      try {
+                        if (file.size > MAX_ARCHIVE_BYTES) throw new Error('存档不能超过 32 MiB。');
+                        const summary = await inspectArchive(file);
+                        if (summary.rule !== rule)
+                          throw new Error('存档规则与所选规则不匹配，请返回选择对应规则。');
+                        setArchive({ file, summary });
+                        setConfiguration(null);
+                        setName(summary.name);
+                      } catch (err) {
+                        setError((err as Error).message);
+                      } finally {
+                        setBusy(false);
+                        if (archiveFile.current) archiveFile.current.value = '';
+                      }
+                    }}
+                  />
+                  {archive && (
+                    <div className="gateway-archive-preview">
+                      <b>{archive.summary.name}</b>
+                      <small>已载入：{archive.file.name}</small>
+                      <p>保存于 {new Date(archive.summary.exportedAt).toLocaleString('zh-CN')}</p>
+                      <ArchiveSummaryView value={archive.summary} />
+                      <p>将创建新房间并恢复原阶段。稍后向每位玩家分发各自的席位恢复码。</p>
+                      <button
+                        className="text-button"
+                        type="button"
+                        onClick={() => setArchive(null)}
+                      >
+                        移除存档，创建新故事
+                      </button>
+                    </div>
+                  )}
+                </div>
+                {!archive && (
+                  <div className="gateway-config">
+                    <button
+                      className="text-button"
+                      type="button"
+                      disabled={busy}
+                      onClick={() => configFile.current?.click()}
+                    >
+                      <Upload size={15} />
+                      从配置文件创建
+                    </button>
+                    <input
+                      ref={configFile}
+                      className="visually-hidden"
+                      type="file"
+                      accept=".json,.md,.markdown"
+                      aria-label="新房间配置文件"
+                      onChange={async (e) => {
+                        const file = e.target.files?.[0];
+                        if (!file) return;
+                        try {
+                          if (file.size > MAX_ROOM_CONFIG_BYTES)
+                            throw new Error('房间配置不能超过 128 KiB。');
+                          const config = parseRoomConfig(await file.text());
+                          if (config.rule !== rule)
+                            throw new Error('配置规则与所选规则不匹配，请返回选择对应规则。');
+                          setConfiguration(config);
+                          setArchive(null);
+                          setName(config.name);
+                          setMode(config.mode);
+                          setError('');
+                        } catch (err) {
+                          setError((err as Error).message);
+                        } finally {
+                          if (configFile.current) configFile.current.value = '';
+                        }
+                      }}
+                    />
+                    {configuration && (
+                      <>
+                        <details>
+                          <summary>已载入配置：{configuration.name}</summary>
+                          <ConfigurationSummary value={{ ...configuration, name, mode }} />
+                        </details>
+                        <button
+                          type="button"
+                          className="text-button"
+                          onClick={() => setConfiguration(null)}
+                        >
+                          移除配置，使用默认制卡要求
+                        </button>
+                      </>
+                    )}
+                  </div>
+                )}
                 <label className="field">
                   房间名称
                   <input
                     value={name}
+                    disabled={!!archive}
                     onChange={(e) => setName(e.target.value)}
                     placeholder={rule === 'dnd' ? '例如：雾港的来信' : '例如：钟声响起之前'}
                     required
-                    maxLength={40}
+                    maxLength={60}
                   />
                 </label>
-                <fieldset className="mode-field">
-                  <legend>这次在哪里演绎故事？</legend>
-                  <button
-                    type="button"
-                    aria-pressed={mode === 'in-room'}
-                    className={`mode-option ${mode === 'in-room' ? 'selected' : ''}`}
-                    onClick={() => setMode('in-room')}
-                  >
-                    <MessageSquare size={20} />
-                    <span>
-                      <b>就在这里</b>
-                      <small>文字叙事、公共记录和主持人灵感小窗</small>
-                    </span>
-                    <span className="radio-mark">{mode === 'in-room' && <Check size={12} />}</span>
-                  </button>
-                  <button
-                    type="button"
-                    aria-pressed={mode === 'external'}
-                    className={`mode-option ${mode === 'external' ? 'selected' : ''}`}
-                    onClick={() => setMode('external')}
-                  >
-                    <Headphones size={20} />
-                    <span>
-                      <b>在其他地方</b>
-                      <small>线下或语音跑团，这里专注制卡与掷骰</small>
-                    </span>
-                    <span className="radio-mark">{mode === 'external' && <Check size={12} />}</span>
-                  </button>
-                </fieldset>
+                {!archive && (
+                  <fieldset className="mode-field">
+                    <legend>这次在哪里演绎故事？</legend>
+                    <button
+                      type="button"
+                      aria-pressed={mode === 'in-room'}
+                      className={`mode-option ${mode === 'in-room' ? 'selected' : ''}`}
+                      onClick={() => setMode('in-room')}
+                    >
+                      <MessageSquare size={20} />
+                      <span>
+                        <b>就在这里</b>
+                        <small>文字叙事、公共记录和主持人灵感小窗</small>
+                      </span>
+                      <span className="radio-mark">
+                        {mode === 'in-room' && <Check size={12} />}
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      aria-pressed={mode === 'external'}
+                      className={`mode-option ${mode === 'external' ? 'selected' : ''}`}
+                      onClick={() => setMode('external')}
+                    >
+                      <Headphones size={20} />
+                      <span>
+                        <b>在其他地方</b>
+                        <small>线下或语音跑团，这里专注制卡与掷骰</small>
+                      </span>
+                      <span className="radio-mark">
+                        {mode === 'external' && <Check size={12} />}
+                      </span>
+                    </button>
+                  </fieldset>
+                )}
               </>
             ) : (
               <>
@@ -302,6 +444,20 @@ export function Gateway({
                     autoComplete="off"
                   />
                 </label>
+                <label className="field">
+                  席位恢复码（续团时填写）
+                  <input
+                    value={seatCode}
+                    onChange={(e) =>
+                      setSeatCode(e.target.value.toUpperCase().replace(/[^A-F0-9]/g, ''))
+                    }
+                    placeholder="由主持人提供，普通新玩家留空"
+                    maxLength={16}
+                    minLength={16}
+                    autoComplete="off"
+                  />
+                  <small>恢复原角色、资源和行动状态；每个恢复码只可用一次。</small>
+                </label>
                 <div className="form-note">
                   <Users size={20} />
                   <p>
@@ -319,7 +475,13 @@ export function Gateway({
             )}
             <button className="button primary full" disabled={busy} type="submit">
               {busy ? <Spinner /> : tab === 'create' ? <Plus size={18} /> : <LogIn size={18} />}
-              {busy ? '正在连接…' : tab === 'create' ? '创建房间，成为主持人' : '加入房间'}
+              {busy
+                ? '正在连接…'
+                : tab === 'create'
+                  ? archive
+                    ? '恢复存档，继续故事'
+                    : '创建房间，成为主持人'
+                  : '加入房间'}
             </button>
             <p className="form-footnote">无需注册 · 使用本浏览器可自动重回房间</p>
           </form>

@@ -1,3 +1,11 @@
+import { ImageLifecycle } from './image-lifecycle.ts';
+import { MAX_ARCHIVE_BYTES, archiveSummary } from '../shared/archive.ts';
+import { readArchive, exportArchive } from './archive.ts';
+import { roomSchema, validRoomReferences, visibleEvent } from '../shared/room-state.ts';
+import { AtlasLibrarySchema, mergeAtlases } from '../shared/atlas.ts';
+import { RoomConfigSchema } from '../shared/room-config.ts';
+import { IMAGE_MIMES, MAX_IMAGE_BYTES } from '../shared/media.ts';
+import { decodeImage, imagePath, saveImage } from './images.ts';
 import express from 'express';
 import { createServer } from 'node:http';
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
@@ -13,7 +21,6 @@ import {
 import { DndStatBlockSchema, getDndStatBlockErrors } from '../shared/dnd.ts';
 import {
   emptyEncounter,
-  EncounterSchema,
   EncounterActionSchemas,
   addEncounterCards,
   syncEncounterPlayers,
@@ -23,7 +30,6 @@ import {
   removeCombatant,
   encounterView,
   compareCocMelee,
-  validateEncounterReferences,
 } from '../shared/encounter.ts';
 import { KeeperCardSchema, getKeeperCardErrors } from '../shared/keeper.ts';
 import {
@@ -85,23 +91,32 @@ const checkSchema = z
   })
   .strict();
 const createSchema = z
-  .object({ name, nickname: name, rule: ruleSchema, mode: modeSchema })
+  .object({
+    name,
+    nickname: name,
+    rule: ruleSchema,
+    mode: modeSchema,
+    configuration: RoomConfigSchema.optional(),
+  })
   .strict();
-const joinSchema = z.object({ code: codeSchema, nickname: name, rule: ruleSchema }).strict();
+const joinSchema = z
+  .object({
+    code: codeSchema,
+    nickname: name,
+    rule: ruleSchema,
+    seatCode: z
+      .string()
+      .trim()
+      .toUpperCase()
+      .regex(/^[A-F0-9]{16}$/)
+      .optional(),
+  })
+  .strict();
 const revision = z
   .number()
   .int()
   .min(0)
   .max(Number.MAX_SAFE_INTEGER - 1);
-const reviewSchema = z
-  .object({
-    status: z.enum(['pending', 'approved', 'changes']),
-    note: z.string().max(2000),
-    reviewedAt: z.iso.datetime().nullable(),
-    characterRevision: revision,
-    policyRevision: revision,
-  })
-  .strict();
 function pendingReview(characterRevision: number, policyRevision: number): Member['review'] {
   return { status: 'pending', note: '', reviewedAt: null, characterRevision, policyRevision };
 }
@@ -134,6 +149,9 @@ function migrateSaved(raw: unknown): unknown {
         (member.characterRevision === undefined || member.review === undefined),
     );
   // New private libraries and encounter tools do not invalidate existing reviews.
+  room.historyComplete ??= Array.isArray(room.log) && room.log.length < 300;
+  room.atlases ??= [];
+  room.configRevision ??= 0;
   room.dndCards ??= [];
   room.encounter ??= emptyEncounter();
   if (!legacy) return candidate;
@@ -154,6 +172,16 @@ function migrateSaved(raw: unknown): unknown {
 }
 const actionSchema = z.discriminatedUnion('type', [
   ...EncounterActionSchemas,
+  z.object({ type: z.literal('atlas-save'), atlases: AtlasLibrarySchema.min(1) }).strict(),
+  z.object({ type: z.literal('atlas-delete'), atlasId: id }).strict(),
+  z.object({ type: z.literal('atlas-publish'), atlasId: id, sceneId: id }).strict(),
+  z
+    .object({
+      type: z.literal('room-config'),
+      configuration: RoomConfigSchema,
+      expectedRevision: revision,
+    })
+    .strict(),
   z
     .object({
       type: z.literal('character-adjust'),
@@ -231,103 +259,23 @@ const actionSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('kick'), memberId: id }).strict(),
   z.object({ type: z.literal('transfer-host'), memberId: id }).strict(),
 ]);
-const memberSchema = z
-  .object({
-    id,
-    name,
-    role: z.enum(['host', 'player']),
-    color: z.string().regex(/^#[0-9a-f]{6}$/i),
-    online: z.boolean(),
-    ready: z.boolean(),
-    character: characterSchema.nullable(),
-    characterRevision: revision,
-    review: reviewSchema,
-  })
-  .strict();
-const diceSchema = z
-  .object({
-    expression: z.string().max(120),
-    groups: z
-      .array(
-        z
-          .object({
-            count: z.number().int().min(1).max(100),
-            sides: z.number().int().min(2).max(1000),
-            rolls: z.array(z.number().int()).max(100),
-            sign: z.union([z.literal(-1), z.literal(1)]),
-          })
-          .strict()
-          .refine(
-            (group) =>
-              group.rolls.length === group.count &&
-              group.rolls.every((roll) => roll >= 1 && roll <= group.sides),
-          ),
-      )
-      // Each group contains at least one die; rollDice permits 100 dice in total.
-      .max(100),
-    modifier: z.number().int(),
-    total: z.number().int(),
-  })
-  .strict();
-const checkResultSchema = z
-  .object({
-    label: z.string().max(200),
-    rolls: z.array(z.number().int()).max(20),
-    selected: z.number().int(),
-    modifier: z.number().int(),
-    total: z.number().int(),
-    target: z.number().int(),
-    outcome: z.string().max(200),
-    success: z.boolean(),
-  })
-  .strict();
-const eventSchema = z
-  .object({
-    id,
-    type: z.enum(['system', 'chat', 'roll', 'check']),
-    memberId: z.string().max(100),
-    name: z.string().max(60),
-    content: z.string().max(4000),
-    createdAt: z.iso.datetime(),
-    visibility: visibilitySchema,
-    requestId: id.optional(),
-    roll: diceSchema.optional(),
-    check: checkResultSchema.optional(),
-  })
-  .strict();
-const roomSchema = z
-  .object({
-    code: codeSchema,
-    name,
-    rule: ruleSchema,
-    hostId: id,
-    mode: modeSchema,
-    phase: z.enum(['lobby', 'active']),
-    members: z.array(memberSchema).min(1).max(8),
-    log: z.array(eventSchema).max(300),
-    scene: z.object({ title: z.string().max(100), description: z.string().max(4000) }).strict(),
-    initiative: z.array(z.object({ memberId: id, value: z.number().int() }).strict()).max(8),
-    activeTurn: z.number().int().min(0).max(7),
-    round: z.number().int().min(0).max(100000),
-    createdAt: z.iso.datetime(),
-    creationPolicy: CreationPolicySchema,
-    policyRevision: revision,
-    keeperCards: z.array(KeeperCardSchema).max(200),
-    dndCards: z.array(DndStatBlockSchema).max(200),
-    encounter: EncounterSchema,
-  })
-  .strict();
 const savedSchema = z
   .object({
     room: roomSchema,
     tokens: z.record(z.string(), z.string().regex(/^[a-f0-9]{64}$/)),
     updatedAt: z.number().finite(),
+    seatClaims: z.record(z.string(), z.string().regex(/^[A-F0-9]{16}$/)).default({}),
+    imageDescriptions: z.record(z.string(), z.string().trim().min(1).max(2000)).default({}),
+    imageSessionAt: z.number().finite().nullable().default(null),
   })
   .strict();
 interface StoredRoom {
   room: Room;
   tokens: Record<string, string>;
   updatedAt: number;
+  seatClaims: Record<string, string>;
+  imageDescriptions: Record<string, string>;
+  imageSessionAt: number | null;
 }
 interface BoundSeat {
   roomCode: string;
@@ -335,6 +283,7 @@ interface BoundSeat {
 }
 export interface ServerOptions {
   dataDir?: string;
+  imageDir?: string;
   geminiKey?: string;
   geminiModel?: string;
   allowedOrigins?: string[];
@@ -370,6 +319,7 @@ export function createAppServer(options: ServerOptions = {}) {
   const fetcher = options.fetch ?? fetch;
   const dataDir = resolve(options.dataDir ?? process.env.DATA_DIR ?? './data');
   const storagePath = resolve(dataDir, 'rooms.json');
+  const imageDir = resolve(options.imageDir ?? process.env.IMAGE_DIR ?? resolve(dataDir, 'images'));
   const ttl = options.roomTtlMs ?? 7 * 24 * 60 * 60 * 1000;
   const maxRooms = options.maxRooms ?? 200;
   const geminiKey = options.geminiKey ?? process.env.GEMINI_API_KEY ?? '';
@@ -381,6 +331,7 @@ export function createAppServer(options: ServerOptions = {}) {
       .map((x) => x.trim())
       .filter(Boolean);
   mkdirSync(dataDir, { recursive: true });
+  const images = new ImageLifecycle(dataDir, imageDir);
   const rooms = new Map<string, StoredRoom>();
   if (existsSync(storagePath)) {
     try {
@@ -388,36 +339,26 @@ export function createAppServer(options: ServerOptions = {}) {
       if (Array.isArray(saved))
         for (const raw of saved.slice(0, maxRooms)) {
           const checked = savedSchema.safeParse(migrateSaved(raw));
-          if (!checked.success || now() - checked.data.updatedAt > ttl) continue;
+          if (!checked.success) continue;
           const entry = checked.data as StoredRoom;
-          const ids = new Set(entry.room.members.map((m) => m.id));
           if (
-            ids.size !== entry.room.members.length ||
-            !ids.has(entry.room.hostId) ||
-            entry.room.members.filter((m) => m.role === 'host').length !== 1 ||
-            entry.room.members.find((m) => m.id === entry.room.hostId)?.role !== 'host' ||
-            Object.keys(entry.tokens).length !== ids.size ||
-            [...ids].some((memberId) => !entry.tokens[memberId]) ||
-            entry.room.members.some((m) => m.character && m.character.rule !== entry.room.rule) ||
-            entry.room.creationPolicy.rule !== entry.room.rule ||
-            (entry.room.rule !== 'coc' && entry.room.keeperCards.length > 0) ||
-            (entry.room.rule !== 'dnd' && entry.room.dndCards.length > 0) ||
-            new Set(entry.room.dndCards.map((card) => card.id)).size !==
-              entry.room.dndCards.length ||
-            !validateEncounterReferences(
-              entry.room.encounter,
-              entry.room.members,
-              entry.room.rule,
-            ) ||
-            new Set(entry.room.keeperCards.map((card) => card.id)).size !==
-              entry.room.keeperCards.length ||
-            entry.room.initiative.some((i) => !ids.has(i.memberId)) ||
-            new Set(entry.room.initiative.map((i) => i.memberId)).size !==
-              entry.room.initiative.length ||
-            (entry.room.initiative.length > 0 &&
-              entry.room.activeTurn >= entry.room.initiative.length)
+            !validRoomReferences(entry.room) ||
+            Object.keys(entry.tokens).length !== entry.room.members.length ||
+            entry.room.members.some((m) => !entry.tokens[m.id]) ||
+            Object.keys(entry.seatClaims).some(
+              (memberId) =>
+                !entry.room.members.some((m) => m.id === memberId && m.role === 'player'),
+            )
           )
             continue;
+          for (const event of entry.room.log)
+            if (event.image) {
+              event.image = images.recover(
+                event.image,
+                entry.imageSessionAt ?? (event.image.reference ? 0 : entry.updatedAt),
+              );
+            }
+          if (now() - entry.updatedAt > ttl) continue;
           entry.room.members.forEach((m) => {
             m.online = false;
           });
@@ -427,9 +368,10 @@ export function createAppServer(options: ServerOptions = {}) {
       console.warn('房间存档无法读取，已跳过；原文件将在下次保存时更新。');
     }
   }
+  images.discoverOrphans();
+  images.collect(now());
   const app = express();
   app.disable('x-powered-by');
-  app.use(express.json({ limit: '32kb' }));
   const httpServer = createServer(app);
   const io = new Server(httpServer, {
     // Keeper imports are bounded to 8 MiB; other actions retain the 512 KiB limit.
@@ -482,9 +424,17 @@ export function createAppServer(options: ServerOptions = {}) {
     const isHost = entry.room.hostId === memberId;
     return {
       ...entry.room,
-      log: entry.room.log.filter((event) => event.visibility === 'public' || isHost),
+      log: entry.room.log.slice(-300).flatMap((event) => {
+        const visible = visibleEvent(event, isHost);
+        return visible ? [visible] : [];
+      }),
+      historyBefore: entry.room.log.length > 300 ? entry.room.log.at(-300)?.id : undefined,
+      seatClaims: isHost
+        ? Object.entries(entry.seatClaims).map(([memberId, code]) => ({ memberId, code }))
+        : [],
       keeperCards: isHost ? entry.room.keeperCards : [],
       dndCards: isHost ? entry.room.dndCards : [],
+      atlases: isHost ? entry.room.atlases : [],
       encounter: encounterView(entry.room.encounter, isHost),
     };
   }
@@ -502,9 +452,27 @@ export function createAppServer(options: ServerOptions = {}) {
     room.encounter = syncEncounterPlayers(room.encounter, room.members);
     projectInitiative(room);
   }
+  const playing = (entry: StoredRoom) =>
+    entry.room.phase === 'active' && entry.room.members.some((m) => m.online);
+  function syncImageSessions() {
+    try {
+      images.endMissingRooms(new Set(rooms.keys()), now());
+      for (const entry of rooms.values())
+        images.setSession(
+          entry.room.code,
+          entry.room.log.flatMap((e) => (e.image ? [e.image] : [])),
+          playing(entry),
+          now(),
+        );
+    } catch {
+      console.warn('图片保留记录更新失败，将在下一次维护时重试，请检查数据目录。');
+    }
+  }
   function broadcast(entry: StoredRoom) {
     entry.updatedAt = now();
+    if (playing(entry) || images.isRoomActive(entry.room.code)) entry.imageSessionAt = now();
     persist();
+    syncImageSessions();
     for (const [socketId, binding] of bindings)
       if (binding.roomCode === entry.room.code)
         io.sockets.sockets.get(socketId)?.emit('room:state', view(entry, binding.memberId));
@@ -526,7 +494,7 @@ export function createAppServer(options: ServerOptions = {}) {
       visibility: 'public',
       ...extra,
     });
-    if (entry.room.log.length > 300) entry.room.log.splice(0, entry.room.log.length - 300);
+    // Keep the full history on disk. Socket snapshots project only the newest 300 events.
   }
   function authenticate(raw: unknown): { entry: StoredRoom; member: Member; session: Session } {
     const session = parse(sessionSchema, raw);
@@ -563,6 +531,7 @@ export function createAppServer(options: ServerOptions = {}) {
     const notifications: (() => void)[] = [];
     entry.room.members = entry.room.members.filter((m) => m.id !== member.id);
     delete entry.tokens[member.id];
+    delete entry.seatClaims[member.id];
     aiLast.delete(`${entry.room.code}:${member.id}`);
     for (const [socketId, binding] of bindings)
       if (binding.roomCode === entry.room.code && binding.memberId === member.id) {
@@ -590,6 +559,7 @@ export function createAppServer(options: ServerOptions = {}) {
           }
         rooms.delete(entry.room.code);
         persist();
+        syncImageSessions();
         notifications.forEach((notify) => notify());
         return;
       }
@@ -597,6 +567,7 @@ export function createAppServer(options: ServerOptions = {}) {
     if (entry.room.members.length === 0) {
       rooms.delete(entry.room.code);
       persist();
+      syncImageSessions();
       notifications.forEach((notify) => notify());
       return;
     }
@@ -605,6 +576,7 @@ export function createAppServer(options: ServerOptions = {}) {
     notifications.forEach((notify) => notify());
   }
   function cleanup() {
+    for (const entry of rooms.values()) if (playing(entry)) entry.imageSessionAt = now();
     for (const [code, entry] of rooms)
       if (now() - entry.updatedAt > ttl && !entry.room.members.some((m) => m.online))
         rooms.delete(code);
@@ -615,6 +587,12 @@ export function createAppServer(options: ServerOptions = {}) {
       persist();
     } catch {
       console.warn('房间清理后的存档保存失败，请检查数据目录。');
+    }
+    syncImageSessions();
+    try {
+      images.collect(now());
+    } catch {
+      console.warn('图片清理失败，将在下次维护时重试，请检查图片目录。');
     }
   }
   const cleanupTimer = setInterval(cleanup, 60_000);
@@ -655,6 +633,10 @@ export function createAppServer(options: ServerOptions = {}) {
     handler<RoomConnection>('room:create', (raw) => {
       requireCondition(!bindings.has(socket.id), '请先离开当前房间');
       const input = parse(createSchema, raw);
+      requireCondition(
+        !input.configuration || input.configuration.rule === input.rule,
+        '配置规则与所选规则不匹配',
+      );
       rate(`create:${socket.handshake.address}`, 10);
       cleanup();
       requireCondition(rooms.size < maxRooms, '当前房间数量已达上限，请稍后再试');
@@ -677,25 +659,31 @@ export function createAppServer(options: ServerOptions = {}) {
       const entry: StoredRoom = {
         room: {
           code,
-          name: input.name,
+          name: input.configuration?.name ?? input.name,
           rule: input.rule,
-          mode: input.mode,
+          mode: input.configuration?.mode ?? input.mode,
           hostId: member.id,
           phase: 'lobby',
           members: [member],
           log: [],
-          scene: { title: '', description: '' },
+          historyComplete: true,
+          scene: input.configuration?.scene ?? { title: '', description: '' },
           initiative: [],
           activeTurn: 0,
           round: 0,
           createdAt: new Date(now()).toISOString(),
-          creationPolicy: defaultCreationPolicy(input.rule),
+          creationPolicy: input.configuration?.creationPolicy ?? defaultCreationPolicy(input.rule),
           policyRevision: 0,
+          configRevision: 0,
+          atlases: [],
           keeperCards: [],
           dndCards: [],
           encounter: emptyEncounter(),
         },
         tokens: { [member.id]: token },
+        seatClaims: {},
+        imageDescriptions: {},
+        imageSessionAt: null,
         updatedAt: now(),
       };
       rooms.set(code, entry);
@@ -712,8 +700,39 @@ export function createAppServer(options: ServerOptions = {}) {
       const input = parse(joinSchema, raw);
       const entry = rooms.get(input.code);
       requireCondition(entry, '房间不存在或已过期');
-      requireCondition(entry.room.phase === 'lobby', '故事已经开始，暂不接受新成员');
       requireCondition(entry.room.rule === input.rule, '规则不匹配，请选择与房间相同的规则');
+      rate(`join:${socket.handshake.address}`, 30);
+      if (input.seatCode) {
+        const memberId = Object.entries(entry.seatClaims).find(
+          ([, code]) => code === input.seatCode,
+        )?.[0];
+        const member = entry.room.members.find((m) => m.id === memberId && m.role === 'player');
+        requireCondition(member, '席位恢复码无效或已使用，请向主持人确认');
+        transaction = {
+          entry,
+          before: structuredClone(entry),
+          bindings: new Map(bindings),
+          aiLast: new Map(aiLast),
+          committed: false,
+        };
+        delete entry.seatClaims[member.id];
+        member.name = input.nickname;
+        addEvent(entry, 'system', null, `${member.name}回到了上次的席位`);
+        bind(socket, entry, member);
+        broadcast(entry);
+        return {
+          session: {
+            roomCode: entry.room.code,
+            memberId: member.id,
+            token: entry.tokens[member.id],
+          },
+          room: view(entry, member.id),
+        };
+      }
+      requireCondition(
+        entry.room.phase === 'lobby',
+        '故事已经开始，续团玩家请填写主持人提供的席位恢复码',
+      );
       requireCondition(entry.room.members.length < 8, '房间已满，最多容纳 8 人');
       const member: Member = {
         id: randomUUID(),
@@ -748,7 +767,7 @@ export function createAppServer(options: ServerOptions = {}) {
         raw &&
         typeof raw === 'object' &&
         'type' in raw &&
-        ['keeper-save', 'dnd-save'].includes(String(raw.type));
+        ['keeper-save', 'dnd-save', 'atlas-save'].includes(String(raw.type));
       requireCondition(
         Buffer.byteLength(JSON.stringify(raw) ?? '', 'utf8') <=
           (keeperBatch ? 8 : 0.5) * 1024 * 1024,
@@ -783,6 +802,51 @@ export function createAppServer(options: ServerOptions = {}) {
         }
       };
       switch (action.type) {
+        case 'atlas-save':
+          host();
+          requireCondition(
+            action.atlases.every((a) => a.rule === 'any' || a.rule === room.rule),
+            '地图集规则与房间不匹配',
+          );
+          room.atlases = mergeAtlases(room.atlases, action.atlases);
+          break;
+        case 'atlas-delete':
+          host();
+          requireCondition(
+            room.atlases.some((a) => a.id === action.atlasId),
+            '地图册不存在',
+          );
+          room.atlases = room.atlases.filter((a) => a.id !== action.atlasId);
+          break;
+        case 'atlas-publish': {
+          host();
+          const atlas = room.atlases.find((a) => a.id === action.atlasId);
+          const scene = atlas?.scenes.find((s) => s.id === action.sceneId);
+          requireCondition(scene, '场景不存在，请刷新地图集');
+          room.scene = { title: scene.title, description: scene.description };
+          room.configRevision += 1;
+          addEvent(entry, 'system', member, `公布场景：${scene.title}`, {
+            scene: structuredClone(room.scene),
+          });
+          break;
+        }
+        case 'room-config':
+          host();
+          lobby();
+          requireCondition(
+            action.expectedRevision === room.configRevision,
+            '房间配置已更新，请重新读取后再导入',
+          );
+          requireCondition(action.configuration.rule === room.rule, '配置规则与房间规则不匹配');
+          room.name = action.configuration.name;
+          room.mode = action.configuration.mode;
+          room.scene = structuredClone(action.configuration.scene);
+          room.creationPolicy = structuredClone(action.configuration.creationPolicy);
+          room.configRevision += 1;
+          room.policyRevision += 1;
+          invalidateReviews(room);
+          addEvent(entry, 'system', member, '导入了房间配置，请重新准备并审核人物卡');
+          break;
         case 'character-adjust': {
           host();
           requireCondition(
@@ -817,6 +881,7 @@ export function createAppServer(options: ServerOptions = {}) {
           requireCondition(action.policy.rule === room.rule, '建卡规则与房间规则不匹配');
           room.creationPolicy = structuredClone(action.policy);
           room.policyRevision += 1;
+          room.configRevision += 1;
           invalidateReviews(room);
           break;
         case 'review-character': {
@@ -989,11 +1054,16 @@ export function createAppServer(options: ServerOptions = {}) {
         case 'scene':
           host();
           room.scene = { title: action.title, description: action.description };
+          room.configRevision += 1;
+          addEvent(entry, 'system', member, `更新场景：${action.title || '未命名场景'}`, {
+            scene: structuredClone(room.scene),
+          });
           break;
         case 'mode':
           host();
           lobby();
           room.mode = action.mode;
+          room.configRevision += 1;
           break;
         case 'resource': {
           const character = target(action.memberId);
@@ -1108,7 +1178,7 @@ export function createAppServer(options: ServerOptions = {}) {
             'system',
             member,
             `${action.attacker}：${attack.selected}／${attack.target}，${attack.outcome}；${action.defender}：${defense.selected}／${defense.target}，${defense.outcome}。${compareCocMelee(attack, defense, action.defense)}（不自动扣除 HP）`,
-            { visibility: action.visibility },
+            { visibility: action.visibility, secretLabel: '近战对抗' },
           );
           break;
         }
@@ -1176,11 +1246,305 @@ export function createAppServer(options: ServerOptions = {}) {
     });
   });
 
+  function imageSeat(request: express.Request) {
+    return authenticate({
+      roomCode: request.params.code,
+      memberId: request.headers['x-interlude-member'],
+      token: request.headers.authorization?.match(/^Bearer ([a-f0-9]{64})$/)?.[1],
+    });
+  }
+  function archiveHost(request: express.Request) {
+    const result = imageSeat(request);
+    requireCondition(result.member.id === result.entry.room.hostId, '只有主持人可以导出全局存档');
+    return result;
+  }
+  const archiveAccess: express.RequestHandler = (request, response, next) => {
+    try {
+      const { entry, member } = archiveHost(request);
+      rate(`archive:${entry.room.code}:${member.id}`, 20);
+      next();
+    } catch (error) {
+      response.status(403).json({ error: failure(error) });
+    }
+  };
+  app.get('/api/rooms/:code/archive', archiveAccess, (request, response) => {
+    const { entry } = archiveHost(request);
+    response.set('Cache-Control', 'private, no-store').json({
+      summary: archiveSummary(entry.room, new Date(now()).toISOString()),
+      images: entry.room.log.flatMap((e) =>
+        e.image
+          ? [
+              {
+                image: e.image,
+                path: images.contextPath(e.image),
+                sender: e.name,
+                content: e.content,
+                createdAt: e.createdAt,
+                description:
+                  entry.imageDescriptions[e.image.id] ?? e.imageDescription?.description ?? '',
+              },
+            ]
+          : [],
+      ),
+    });
+  });
+  app.post(
+    '/api/rooms/:code/archive',
+    archiveAccess,
+    express.json({ limit: '16mb' }),
+    async (request, response) => {
+      try {
+        const { entry } = archiveHost(request);
+        const { descriptions, includeImages } = parse(
+          z
+            .object({
+              descriptions: z
+                .record(z.string().uuid(), z.string().trim().min(1).max(2000))
+                .default({}),
+              includeImages: z.boolean().default(true),
+            })
+            .strict(),
+          request.body,
+        );
+        const bytes = await exportArchive(entry.room, descriptions, new Date(now()).toISOString(), {
+          includeImages,
+          imagePath: (image) => images.contextPath(image),
+        });
+        // Compression is asynchronous; recheck host access before sending private data.
+        requireCondition(archiveHost(request).entry === entry, '房间已变更，请重试');
+        const before = entry.imageDescriptions;
+        entry.imageDescriptions = { ...before, ...descriptions };
+        try {
+          persist();
+        } catch (error) {
+          entry.imageDescriptions = before;
+          throw error;
+        }
+        response
+          .set({
+            'Content-Type': 'application/zip',
+            'Content-Disposition': 'attachment; filename="interlude-room.zip"',
+            'Cache-Control': 'private, no-store',
+          })
+          .send(Buffer.from(bytes));
+      } catch (error) {
+        response.status(400).json({ error: failure(error) });
+      }
+    },
+  );
+  const importAccess: express.RequestHandler = (request, response, next) => {
+    try {
+      rate(`archive-import:${request.ip}`, 10);
+      requireCondition(request.is('application/zip'), '请选择 ZIP 存档');
+      next();
+    } catch (error) {
+      response.status(400).json({ error: failure(error) });
+    }
+  };
+  app.post(
+    '/api/archives/inspect',
+    importAccess,
+    express.raw({ type: 'application/zip', limit: MAX_ARCHIVE_BYTES }),
+    (request, response) => {
+      try {
+        const { room, exportedAt } = readArchive(request.body);
+        response.set('Cache-Control', 'no-store').json(archiveSummary(room, exportedAt));
+      } catch (error) {
+        response.status(400).json({ error: failure(error) });
+      }
+    },
+  );
+  app.post(
+    '/api/archives/restore',
+    importAccess,
+    express.raw({ type: 'application/zip', limit: MAX_ARCHIVE_BYTES }),
+    (request, response) => {
+      try {
+        const nickname = parse(
+          name,
+          decodeURIComponent(String(request.headers['x-interlude-nickname'] ?? '')),
+        );
+        const rule = parse(ruleSchema, request.headers['x-interlude-rule']);
+        const { room } = readArchive(request.body);
+        requireCondition(room.rule === rule, '存档规则与所选规则不匹配');
+        cleanup();
+        requireCondition(rooms.size < maxRooms, '当前房间数量已达上限，请稍后再试');
+        let code: string;
+        do {
+          code = randomBytes(4).toString('hex').slice(0, 6).toUpperCase();
+        } while (rooms.has(code));
+        room.code = code;
+        room.members.forEach((m) => {
+          m.online = false;
+        });
+        const host = room.members.find((m) => m.id === room.hostId)!;
+        host.name = nickname;
+        const tokens = Object.fromEntries(
+          room.members.map((m) => [m.id, randomBytes(32).toString('hex')]),
+        );
+        const seatClaims = Object.fromEntries(
+          room.members
+            .filter((m) => m.role === 'player')
+            .map((m) => [m.id, randomBytes(8).toString('hex').toUpperCase()]),
+        );
+        const entry: StoredRoom = {
+          room,
+          tokens,
+          seatClaims,
+          imageDescriptions: {},
+          imageSessionAt: null,
+          updatedAt: now(),
+        };
+        addEvent(
+          entry,
+          'system',
+          null,
+          `${host.name}从全局存档恢复了房间；角色、场景与行动进度已保留`,
+        );
+        rooms.set(code, entry);
+        try {
+          persist();
+        } catch (error) {
+          rooms.delete(code);
+          throw error;
+        }
+        response
+          .status(201)
+          .set('Cache-Control', 'no-store')
+          .json({
+            session: { roomCode: code, memberId: host.id, token: tokens[host.id] },
+            room: view(entry, host.id),
+          });
+      } catch (error) {
+        response.status(400).json({ error: failure(error) });
+      }
+    },
+  );
+  app.get('/api/rooms/:code/history', (request, response) => {
+    try {
+      const { entry, member } = imageSeat(request);
+      const before = request.query.before;
+      const index =
+        before === undefined
+          ? entry.room.log.length
+          : entry.room.log.findIndex((e) => e.id === before);
+      requireCondition(index >= 0, '历史记录位置已失效，请刷新后重试');
+      const start = Math.max(0, index - 200);
+      response.set('Cache-Control', 'private, no-store').json({
+        events: entry.room.log.slice(start, index).flatMap((e) => {
+          const visible = visibleEvent(e, member.id === entry.room.hostId);
+          return visible ? [visible] : [];
+        }),
+        before: entry.room.log[start]?.id ?? null,
+        hasMore: start > 0,
+      });
+    } catch (error) {
+      response.status(403).json({ error: failure(error) });
+    }
+  });
+  const imageAccess: express.RequestHandler = (request, response, next) => {
+    try {
+      const { entry, member } = imageSeat(request);
+      if (request.method === 'POST') {
+        requireCondition(
+          entry.room.phase === 'active' && entry.room.mode === 'in-room',
+          '请在故事开始后使用房内图片聊天',
+        );
+        rate(`image:${entry.room.code}:${member.id}`, 12);
+      }
+      next();
+    } catch (error) {
+      response.status(403).json({ error: failure(error) });
+    }
+  };
+  app.post(
+    '/api/rooms/:code/images',
+    imageAccess,
+    express.json({ limit: '12mb' }),
+    (request, response) => {
+      let stored: import('../shared/media.ts').ChatImage | undefined;
+      try {
+        // Recheck after the asynchronous body parser: the room may have paused or removed this seat.
+        const { entry, member } = imageSeat(request);
+        requireCondition(
+          entry.room.phase === 'active' && entry.room.mode === 'in-room',
+          '请在故事开始后使用房内图片聊天',
+        );
+        const input = parse(
+          z
+            .object({
+              name: z.string().trim().min(1).max(160),
+              mime: z.enum(IMAGE_MIMES),
+              data: z.string().max(Math.ceil(MAX_IMAGE_BYTES / 3) * 4),
+              content: z.string().trim().max(2000),
+              requestId: z.string().uuid(),
+            })
+            .strict(),
+          request.body,
+        );
+        const existing = entry.room.log.find(
+          (e) => e.requestId === input.requestId && e.memberId === member.id && e.image,
+        );
+        if (existing) return void response.json({ eventId: existing.id });
+        const bytes = decodeImage(input.data, input.mime);
+        let image: import('../shared/media.ts').ChatImage = {
+          id: randomUUID(),
+          mime: input.mime,
+          name: input.name,
+          bytes: bytes.length,
+        };
+        saveImage(imageDir, image, bytes);
+        stored = image;
+        image = images.register(image, now());
+        const before = structuredClone(entry);
+        try {
+          addEvent(entry, 'chat', member, input.content, { image, requestId: input.requestId });
+          broadcast(entry);
+        } catch (error) {
+          Object.assign(entry, before);
+          throw error;
+        }
+        stored = undefined;
+        response.status(201).json({ eventId: entry.room.log.at(-1)!.id });
+      } catch (error) {
+        if (stored) {
+          try {
+            images.rollbackUpload(stored);
+          } catch {
+            console.warn('图片回滚清理失败，请检查图片目录权限。');
+          }
+        }
+        response.status(400).json({ error: failure(error) });
+      }
+    },
+  );
+  app.get('/api/rooms/:code/images/:imageId', imageAccess, (request, response) => {
+    const { entry } = imageSeat(request);
+    const image = entry.room.log.find(
+      (e) => e.image?.id === request.params.imageId && e.visibility === 'public',
+    )?.image;
+    if (!image) return void response.status(404).json({ error: '图片不属于此房间' });
+    if (!images.available(image, now())) {
+      images.flush();
+      return void response
+        .status(410)
+        .set('Cache-Control', 'private, no-store')
+        .json({ error: '图片已过期删除，或原服务器图片不可用', code: 'IMAGE_UNAVAILABLE' });
+    }
+    response.set({
+      'Content-Type': image.mime,
+      'X-Content-Type-Options': 'nosniff',
+      'Cache-Control': 'private, no-store',
+      'Content-Security-Policy': "default-src 'none'; sandbox",
+    });
+    response.sendFile(imagePath(imageDir, image));
+  });
+
   app.get('/api/health', (_request, response) => response.json({ ok: true }));
   app.get('/api/status', (_request, response) =>
     response.json({ aiConfigured: Boolean(geminiKey) }),
   );
-  app.post('/api/inspiration', async (request, response) => {
+  app.post('/api/inspiration', express.json({ limit: '32kb' }), async (request, response) => {
     try {
       const input = parse(
         z
@@ -1339,6 +1703,7 @@ export function createAppServer(options: ServerOptions = {}) {
     app,
     httpServer,
     io,
+    maintain: cleanup,
     listen(port = 0, host = '127.0.0.1'): Promise<number> {
       return new Promise((resolvePort, reject) => {
         httpServer.once('error', reject);

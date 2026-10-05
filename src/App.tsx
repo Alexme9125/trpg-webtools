@@ -19,7 +19,7 @@ import type {
   RuleId,
   Session,
 } from '../shared/types';
-import { act, createRoom, getStatus, joinRoom, resumeRoom, socket } from './api';
+import { act, createRoom, getStatus, joinRoom, resumeRoom, restoreArchive, socket } from './api';
 import { getLibrary, getSession, readStored, saveToLibrary, writeStored } from './storage';
 import { Logo, ThemeToggle, Toast, Spinner } from './components/ui';
 import { Gateway, Library, RuleSelection, RulesModal } from './components/Lobby';
@@ -275,6 +275,10 @@ export default function App() {
               onCreate={async (input: CreateRoomInput) => {
                 acceptConnection(await createRoom(input));
                 notify('房间已创建，把房间码分享给同伴吧。');
+              }}
+              onRestore={async (file, nickname) => {
+                acceptConnection(await restoreArchive(file, nickname, rule));
+                notify('房间已恢复，可在全局存档中复制同伴的席位恢复码。');
               }}
               onJoin={async (input: JoinRoomInput) => {
                 acceptConnection(await joinRoom(input));

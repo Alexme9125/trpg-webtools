@@ -140,6 +140,9 @@ export function AllocationEditor({
     const profile = COC_OCCUPATION_RULES.find((p) => p.name === card.occupation);
     const budget = cocBudget(card);
     const occupied = new Set([...a.occupationSkills, 'creditRating']);
+    const restrictedInterest = policy.allowInterestOnOccupation === false;
+    const invalidInterest =
+      restrictedInterest && [...occupied].some((key) => (a.personal[key] ?? 0) > 0);
     const updatePoints = (key: string, pool: 'occupational' | 'personal', value: number) =>
       set({
         ...a,
@@ -269,6 +272,29 @@ export function AllocationEditor({
           />
           <span>技能上限 {policy.cocSkillCap} · 单项范围优先</span>
         </div>
+        {restrictedInterest && (
+          <div className="allocation-policy-note">
+            <p>本房间专点专用：兴趣点不能投入职业技能或信用评级。</p>
+            {invalidInterest && (
+              <button
+                className="button secondary compact"
+                onClick={() =>
+                  set({
+                    ...a,
+                    personal: Object.fromEntries(
+                      Object.entries(a.personal).map(([key, value]) => [
+                        key,
+                        occupied.has(key) ? 0 : value,
+                      ]),
+                    ),
+                  })
+                }
+              >
+                退回职业技能上的兴趣点
+              </button>
+            )}
+          </div>
+        )}
         <div className="allocation-ledger">
           <div className="allocation-row ledger-head">
             <span>技能 / 基础</span>
@@ -307,7 +333,7 @@ export function AllocationEditor({
                   type="number"
                   min={0}
                   max={Math.max(0, range.max - base - (a.occupational[skill.key] ?? 0))}
-                  disabled={mythosLocked}
+                  disabled={mythosLocked || (restrictedInterest && occupied.has(skill.key))}
                   value={a.personal[skill.key] ?? 0}
                   onChange={(e) => updatePoints(skill.key, 'personal', Number(e.target.value))}
                 />

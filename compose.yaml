@@ -9,10 +9,13 @@ services:
       HOST: 0.0.0.0
       PORT: 3001
       DATA_DIR: /app/data
+      IMAGE_DIR: /app/images
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.8-flash}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
     volumes:
       - room-data:/app/data
+      - ${IMAGE_STORAGE_PATH:-image-data}:/app/images
 volumes:
   room-data:
+  image-data:

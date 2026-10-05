@@ -1,3 +1,6 @@
+import { IMAGE_MIMES, MAX_IMAGE_BYTES } from '../../shared/media';
+import { ChatImage } from './ChatImage';
+import { RoomConfiguration } from './RoomConfiguration';
 import {
   lazy,
   Suspense,
@@ -9,6 +12,10 @@ import {
 } from 'react';
 import {
   BookOpen,
+  Archive,
+  Map as MapIcon,
+  ImagePlus,
+  Settings2,
   Copy,
   Check,
   Crown,
@@ -63,7 +70,7 @@ import {
   exportCharacter,
   proficiencyBonus,
 } from '../../shared/rules';
-import { getInspiration } from '../api';
+import { getInspiration, uploadChatImage, getHistory } from '../api';
 import { validateCreation } from '../../shared/creation';
 import { adjustmentFields, effectiveCharacter, hasAdjustments } from '../../shared/adjustments';
 import { AdjustmentSummary } from './AdjustmentSummary';
@@ -71,6 +78,10 @@ import { ReviewDesk, isApproved, reviewLabel } from './ReviewDesk';
 import { ValidationSummary } from './AllocationEditor';
 import { downloadFile } from '../storage';
 import { DieIcon, Modal, Spinner, hostName, ruleEdition } from './ui';
+const RoomAtlasLibrary = lazy(() =>
+  import('./AtlasToolkit').then((m) => ({ default: m.RoomAtlasLibrary })),
+);
+const RoomArchive = lazy(() => import('./RoomArchive'));
 const EncounterPanel = lazy(() => import('./EncounterPanel'));
 const CharacterAdjustments = lazy(() => import('./CharacterAdjustments'));
 
@@ -104,6 +115,9 @@ export function RoomView({
   const [selectedMember, setSelectedMember] = useState<string | null>(null);
   const [showLibrary, setShowLibrary] = useState(false);
   const [showHost, setShowHost] = useState(false);
+  const [showAtlas, setShowAtlas] = useState(false);
+  const [showArchive, setShowArchive] = useState(!!room.seatClaims?.length);
+  const [showConfiguration, setShowConfiguration] = useState(false);
   const [showEncounter, setShowEncounter] = useState(false);
   const [showReview, setShowReview] = useState(false);
   const [adjustMember, setAdjustMember] = useState<string | null>(null);
@@ -349,8 +363,10 @@ export function RoomView({
               )}
               {card && (
                 <div className={`my-review-status ${isApproved(me, room) ? 'approved' : ''}`}>
-                  <ClipboardCheck size={15} />
-                  <b>{reviewLabel(me, room)}</b>
+                  <span className="review-status-label">
+                    <ClipboardCheck size={15} />
+                    <b>{reviewLabel(me, room)}</b>
+                  </span>
                   {me.review.note && <p>{me.review.note}</p>}
                 </div>
               )}
@@ -431,7 +447,7 @@ export function RoomView({
               )}
             </div>
           </div>
-          <StoryLog room={room} me={me} run={run} notify={notify} />
+          <StoryLog room={room} me={me} session={session} run={run} notify={notify} />
         </section>
         <aside className="tools-panel panel">
           <div className="panel-heading">
@@ -477,7 +493,7 @@ export function RoomView({
             </button>
             {isHost && (
               <>
-                <button onClick={() => setShowReview(true)}>
+                <button aria-label="审核与制卡要求" onClick={() => setShowReview(true)}>
                   <ClipboardCheck size={18} />
                   <span>
                     审核与制卡要求<small>分配核对、剧本范围与审核意见</small>
@@ -487,11 +503,32 @@ export function RoomView({
                 <button onClick={onHostToolkit}>
                   <BookOpen size={18} />
                   <span>
-                    主持人工具集<small>个人备团库、NPC／怪物与剧本导入</small>
+                    主持人工具集<small>个人备团库、地图与剧本导入</small>
                   </span>
                   <ChevronRight size={16} />
                 </button>
 
+                <button aria-label="地图与场景" onClick={() => setShowAtlas(true)}>
+                  <MapIcon size={18} />
+                  <span>
+                    地图与场景<small>查阅本团地图册，快速公布场景</small>
+                  </span>
+                  <ChevronRight size={16} />
+                </button>
+                <button aria-label="全局存档" onClick={() => setShowArchive(true)}>
+                  <Archive size={18} />
+                  <span>
+                    全局存档<small>保存完整旅程，下次从此处续团</small>
+                  </span>
+                  <ChevronRight size={16} />
+                </button>
+                <button aria-label="房间配置" onClick={() => setShowConfiguration(true)}>
+                  <Settings2 size={18} />
+                  <span>
+                    房间配置<small>导入、导出本桌约定与制卡要求</small>
+                  </span>
+                  <ChevronRight size={16} />
+                </button>
                 <button aria-label="场景与回合" onClick={() => setShowHost(true)}>
                   <SlidersHorizontal size={18} />
                   <span>
@@ -530,6 +567,16 @@ export function RoomView({
           </div>
         </aside>
       </div>
+      {showArchive && isHost && (
+        <Suspense fallback={<Spinner />}>
+          <RoomArchive
+            room={room}
+            session={session}
+            onClose={() => setShowArchive(false)}
+            notify={notify}
+          />
+        </Suspense>
+      )}
       {showReview && (
         <ReviewDesk room={room} isHost={isHost} run={run} onClose={() => setShowReview(false)} />
       )}
@@ -608,6 +655,18 @@ export function RoomView({
             run={run}
             onClose={() => setAdjustMember(null)}
           />
+        </Suspense>
+      )}
+      {showConfiguration && isHost && (
+        <RoomConfiguration
+          room={room}
+          onAction={onAction}
+          onClose={() => setShowConfiguration(false)}
+        />
+      )}
+      {showAtlas && isHost && (
+        <Suspense fallback={<Spinner />}>
+          <RoomAtlasLibrary room={room} onAction={onAction} onClose={() => setShowAtlas(false)} />
         </Suspense>
       )}
       {showHost && isHost && (
@@ -826,37 +885,120 @@ type Run = (action: RoomAction) => Promise<boolean>;
 function StoryLog({
   room,
   me,
+  session,
   run,
   notify,
 }: {
   room: Room;
   me: Member;
+  session: Session;
   run: Run;
   notify: Props['notify'];
 }) {
   const [message, setMessage] = useState('');
+  const [imageFile, setImageFile] = useState<File | null>(null);
+  const [imagePreview, setImagePreview] = useState('');
+  const imageInput = useRef<HTMLInputElement>(null);
+  const imageRequestId = useRef('');
+  useEffect(() => {
+    if (!imageFile) {
+      setImagePreview('');
+      return;
+    }
+    const url = URL.createObjectURL(imageFile);
+    setImagePreview(url);
+    return () => URL.revokeObjectURL(url);
+  }, [imageFile]);
+  const chooseImage = (file?: File) => {
+    if (!file) return;
+    if (!IMAGE_MIMES.includes(file.type as (typeof IMAGE_MIMES)[number])) {
+      notify('请选择 PNG、JPEG、GIF 或 WebP 图片。', 'error');
+      return;
+    }
+    if (!file.size || file.size > MAX_IMAGE_BYTES) {
+      notify('图片需大于 0 字节，且不超过 8 MiB。', 'error');
+      return;
+    }
+    setImageFile(file);
+    imageRequestId.current = crypto.randomUUID();
+  };
   const [busy, setBusy] = useState(false);
   const [filter, setFilter] = useState<'all' | 'rolls'>('all');
+  const [history, setHistory] = useState<RoomEvent[]>([]);
+  const [historyCursor, setHistoryCursor] = useState<string | undefined>();
+  const [moreHistory, setMoreHistory] = useState(true);
+  const [loadingHistory, setLoadingHistory] = useState(false);
+  const historyRole = useRef(me.role);
+  useEffect(() => {
+    if (historyRole.current !== me.role) {
+      historyRole.current = me.role;
+      setHistory([]);
+      setHistoryCursor(undefined);
+      setMoreHistory(true);
+    } else
+      setHistory((old) =>
+        old.length ? [...new Map([...old, ...room.log].map((e) => [e.id, e])).values()] : old,
+      );
+  }, [room.log, me.role]);
+  async function loadHistory() {
+    setLoadingHistory(true);
+    const element = scrollRef.current;
+    const height = element?.scrollHeight ?? 0;
+    const top = element?.scrollTop ?? 0;
+    try {
+      const value = await getHistory(
+        session,
+        historyCursor ?? room.historyBefore ?? room.log[0]?.id,
+      );
+      setHistory((old) => [
+        ...new Map([...value.events, ...old, ...room.log].map((e) => [e.id, e])).values(),
+      ]);
+      setHistoryCursor(value.before ?? undefined);
+      setMoreHistory(value.hasMore);
+      atBottom.current = false;
+      requestAnimationFrame(() => {
+        if (element) element.scrollTop = top + element.scrollHeight - height;
+      });
+    } catch (error) {
+      notify((error as Error).message, 'error');
+    } finally {
+      setLoadingHistory(false);
+    }
+  }
   const scrollRef = useRef<HTMLDivElement>(null);
   const atBottom = useRef(true);
   useEffect(() => {
     const element = scrollRef.current;
     if (element && atBottom.current) element.scrollTop = element.scrollHeight;
-  }, [room.log.length]);
+  }, [room.log.at(-1)?.id]);
   const send = async (e: FormEvent) => {
     e.preventDefault();
-    if (!message.trim() || busy) return;
+    if ((!message.trim() && !imageFile) || busy || room.phase !== 'active') return;
     setBusy(true);
-    if (await run({ type: 'message', content: message.trim() })) setMessage('');
-    setBusy(false);
+    try {
+      if (imageFile) {
+        await uploadChatImage(session, imageFile, message.trim(), imageRequestId.current);
+        setImageFile(null);
+        setMessage('');
+      } else if (await run({ type: 'message', content: message.trim() })) setMessage('');
+    } catch (e) {
+      notify((e as Error).message, 'error');
+    } finally {
+      setBusy(false);
+    }
   };
-  const log = room.log.filter(
+  const allEvents = [
+    ...new Map(
+      [...(historyRole.current === me.role ? history : []), ...room.log].map((e) => [e.id, e]),
+    ).values(),
+  ];
+  const log = allEvents.filter(
     (event) => filter === 'all' || event.type === 'roll' || event.type === 'check',
   );
   const exportLog = () => {
-    const text = `# ${room.name}\n\n规则：${ruleEdition(room.rule)}\n\n${room.log.map((event) => `- ${new Date(event.createdAt).toLocaleString('zh-CN')} · ${event.name}${event.visibility === 'host' ? '（主持人暗骰）' : ''}：${event.content}`).join('\n')}`;
+    const text = `# ${room.name}\n\n规则：${ruleEdition(room.rule)}\n\n${allEvents.map((event) => `- ${new Date(event.createdAt).toLocaleString('zh-CN')} · ${event.name}${event.visibility === 'host' ? '（主持人暗骰）' : ''}：${event.content}${event.scene?.description ? `\n  ${event.scene.description}` : ''}${event.image ? ` [图片：${event.image.name}，请在房间中查看或保存]` : ''}${event.imageDescription ? ` [图片描述：${event.imageDescription.name}：${event.imageDescription.description}]` : ''}`).join('\n')}`;
     downloadFile(text, `${room.name}-跑团记录.md`, 'text/markdown');
-    notify('已导出当前保留的房间记录（最近 300 条）。');
+    notify('已导出当前已载入的记录；完整续团请使用全局存档。');
   };
   return (
     <div className="story-panel panel">
@@ -872,7 +1014,7 @@ function StoryLog({
         <button
           className="icon-button"
           onClick={exportLog}
-          title="导出最近 300 条记录"
+          title="导出已载入的记录"
           aria-label="导出房间记录"
         >
           <Download size={16} />
@@ -896,8 +1038,19 @@ function StoryLog({
         aria-label="房间公开记录"
         aria-live="polite"
       >
+        {moreHistory && (room.historyBefore || historyCursor) && (
+          <button
+            className="text-button history-load"
+            disabled={loadingHistory}
+            onClick={() => void loadHistory()}
+          >
+            {loadingHistory ? <Spinner /> : <Clock3 size={14} />} 加载更早记录
+          </button>
+        )}
         {log.length ? (
-          log.map((event) => <EventEntry event={event} room={room} key={event.id} />)
+          log.map((event) => (
+            <EventEntry event={event} room={room} session={session} key={event.id} />
+          ))
         ) : (
           <div className="empty-log">
             <DieIcon size={29} />
@@ -907,6 +1060,41 @@ function StoryLog({
       </div>
       {room.mode === 'in-room' ? (
         <form className="chat-form" onSubmit={send}>
+          <input
+            ref={imageInput}
+            className="visually-hidden"
+            type="file"
+            accept={IMAGE_MIMES.join(',')}
+            aria-label="选择聊天图片文件"
+            disabled={busy || room.phase !== 'active'}
+            onChange={(e) => {
+              chooseImage(e.target.files?.[0]);
+              e.target.value = '';
+            }}
+          />
+          {imageFile && (
+            <div className="chat-attachment-preview">
+              {imagePreview && <img src={imagePreview} alt="待发送图片" />}
+              <div>
+                <b>{imageFile.name}</b>
+                <small>
+                  {(imageFile.size / 1024 / 1024).toFixed(2)} MiB · 发送后房间内所有人可见
+                </small>
+                <small className="chat-attachment-retention">
+                  原图在最后一次游玩结束 14 天后自动删除
+                </small>
+              </div>
+              <button
+                type="button"
+                className="icon-button"
+                aria-label="移除待发送图片"
+                disabled={busy}
+                onClick={() => setImageFile(null)}
+              >
+                <X size={16} />
+              </button>
+            </div>
+          )}
           <textarea
             aria-label="公开叙事内容"
             value={message}
@@ -924,7 +1112,14 @@ function StoryLog({
                   ? '描述眼前的场景，让故事继续…'
                   : '你的角色，会说什么、做什么？'
             }
-            disabled={room.phase !== 'active'}
+            disabled={busy || room.phase !== 'active'}
+            onPaste={(e) => {
+              const file = [...e.clipboardData.files].find((f) => f.type.startsWith('image/'));
+              if (file) {
+                e.preventDefault();
+                chooseImage(file);
+              }
+            }}
             maxLength={2000}
             rows={2}
           />
@@ -932,14 +1127,26 @@ function StoryLog({
             <span>
               <Globe size={12} /> 房间内所有人可见 <span className="enter-hint">· Enter 发送</span>
             </span>
-            <button
-              type="submit"
-              className="send-button"
-              disabled={busy || !message.trim() || room.phase !== 'active'}
-              aria-label="发送公开消息"
-            >
-              {busy ? <Spinner /> : <Send size={16} />}
-            </button>
+            <div className="chat-actions">
+              <button
+                type="button"
+                className="icon-button"
+                disabled={busy || room.phase !== 'active'}
+                onClick={() => imageInput.current?.click()}
+                aria-label="添加图片"
+                title="PNG / JPEG / GIF / WebP，最大 8 MiB"
+              >
+                <ImagePlus size={18} />
+              </button>
+              <button
+                type="submit"
+                className="send-button"
+                disabled={busy || (!message.trim() && !imageFile) || room.phase !== 'active'}
+                aria-label="发送公开消息"
+              >
+                {busy ? <Spinner /> : <Send size={16} />}
+              </button>
+            </div>
           </div>
         </form>
       ) : (
@@ -951,12 +1158,17 @@ function StoryLog({
     </div>
   );
 }
-function EventEntry({ event, room }: { event: RoomEvent; room: Room }) {
+function EventEntry({ event, room, session }: { event: RoomEvent; room: Room; session: Session }) {
   if (event.type === 'system')
     return (
       <div className="system-event">
         <span />
-        <p>{event.content}</p>
+        <p>
+          {event.content}
+          {event.scene?.description && (
+            <span className="event-scene-description">{event.scene.description}</span>
+          )}
+        </p>
         <span />
       </div>
     );
@@ -980,31 +1192,42 @@ function EventEntry({ event, room }: { event: RoomEvent; room: Room }) {
           </time>
           {event.visibility === 'host' && (
             <span className="private-label">
-              <EyeOff size={11} /> 仅主持人
+              <EyeOff size={11} /> {event.secret ? '暗骰 · 结果隐藏' : '仅主持人'}
             </span>
           )}
         </div>
         {event.type === 'chat' ? (
-          <p className="chat-text">{event.content}</p>
+          <>
+            {event.content && <p className="chat-text">{event.content}</p>}
+            {event.image && <ChatImage image={event.image} session={session} />}
+            {event.imageDescription && (
+              <div className="archived-image">
+                <span>图片描述 · {event.imageDescription.name}</span>
+                <p>{event.imageDescription.description}</p>
+              </div>
+            )}
+          </>
         ) : (
           <div
             className={`roll-event ${event.check ? (event.check.success ? 'success' : 'failure') : ''}`}
           >
             <span className="roll-event-icon">
-              {event.check ? <Crosshair size={18} /> : <DieIcon size={24} />}
+              {event.type === 'check' ? <Crosshair size={18} /> : <DieIcon size={24} />}
             </span>
             <div>
-              <b>{event.check?.label ?? event.roll?.expression}</b>
+              <b>{event.secret?.label ?? event.check?.label ?? event.roll?.expression}</b>
               <span>
-                {event.check
-                  ? `${event.check.rolls.join(' / ')}${event.check.modifier ? ` ${event.check.modifier >= 0 ? '+' : ''}${event.check.modifier}` : ''} · 目标 ${event.check.target} · ${event.check.outcome}`
-                  : event.roll?.groups.map((g) => `[${g.rolls.join(', ')}]`).join(' ') +
-                    (event.roll?.modifier
-                      ? ` ${event.roll.modifier >= 0 ? '+' : ''}${event.roll.modifier}`
-                      : '')}
+                {event.secret
+                  ? '点数 ？ · 结果 ？'
+                  : event.check
+                    ? `${event.check.rolls.join(' / ')}${event.check.modifier ? ` ${event.check.modifier >= 0 ? '+' : ''}${event.check.modifier}` : ''} · 目标 ${event.check.target} · ${event.check.outcome}`
+                    : event.roll?.groups.map((g) => `[${g.rolls.join(', ')}]`).join(' ') +
+                      (event.roll?.modifier
+                        ? ` ${event.roll.modifier >= 0 ? '+' : ''}${event.roll.modifier}`
+                        : '')}
               </span>
             </div>
-            <strong>{event.check?.total ?? event.roll?.total}</strong>
+            <strong>{event.secret ? '？' : (event.check?.total ?? event.roll?.total)}</strong>
           </div>
         )}
       </div>
