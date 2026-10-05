@@ -48,6 +48,8 @@ import {
   CheckCheck,
   Clock3,
   ClipboardCheck,
+  Maximize2,
+  Minimize2,
 } from 'lucide-react';
 import type {
   Character,
@@ -76,7 +78,7 @@ import { adjustmentFields, effectiveCharacter, hasAdjustments } from '../../shar
 import { AdjustmentSummary } from './AdjustmentSummary';
 import { ReviewDesk, isApproved, reviewLabel } from './ReviewDesk';
 import { ValidationSummary } from './AllocationEditor';
-import { downloadFile } from '../storage';
+import { downloadFile, readStored, writeStored } from '../storage';
 import { DieIcon, Modal, Spinner, hostName, ruleEdition } from './ui';
 const RoomAtlasLibrary = lazy(() =>
   import('./AtlasToolkit').then((m) => ({ default: m.RoomAtlasLibrary })),
@@ -125,6 +127,12 @@ export function RoomView({
   const [leave, setLeave] = useState(false);
   const [busy, setBusy] = useState(false);
   const [mobileTab, setMobileTab] = useState<'table' | 'tools' | 'party'>('table');
+  const [immersive, setImmersive] = useState(
+    () => readStored<boolean>('interlude-room-immersive', false) === true,
+  );
+  useEffect(() => {
+    writeStored('interlude-room-immersive', immersive);
+  }, [immersive]);
   const run = async (action: RoomAction) => {
     if (!connected) {
       notify('连接尚未恢复，请稍候。', 'error');
@@ -163,7 +171,7 @@ export function RoomView({
     }
   };
   return (
-    <div className="room-view page-enter">
+    <div className={`room-view page-enter${immersive ? ' room-immersive' : ''}`}>
       <div className="room-heading">
         <div className="room-title">
           <span className={`room-rule-mark ${room.rule}`}>
@@ -188,6 +196,19 @@ export function RoomView({
             <b>{room.code}</b>
             <Copy size={14} />
           </button>
+          <button
+            className="room-immersive-toggle"
+            aria-pressed={immersive}
+            aria-controls="room-story-log"
+            title={immersive ? '恢复圆桌与记录布局' : '隐藏圆桌，放大记录区；仅对你生效'}
+            onClick={() => {
+              setImmersive((value) => !value);
+              setMobileTab('table');
+            }}
+          >
+            {immersive ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
+            {immersive ? '退出沉浸' : '沉浸模式'}
+          </button>
           <button className="icon-button" onClick={onRules} aria-label="规则速览">
             <BookOpen size={19} />
           </button>
@@ -201,7 +222,8 @@ export function RoomView({
           className={mobileTab === 'table' ? 'active' : ''}
           onClick={() => setMobileTab('table')}
         >
-          <ArmchairIcon /> 圆桌与记录
+          {immersive ? <MessageSquare size={17} /> : <ArmchairIcon />}
+          {immersive ? '沉浸记录' : '圆桌与记录'}
         </button>
         <button
           className={mobileTab === 'tools' ? 'active' : ''}
@@ -402,14 +424,18 @@ export function RoomView({
           </div>
         </aside>
         <section className="table-column">
-          <div className="table-panel panel">
-            <div className="table-panel-heading">
-              <span className="mini-label">OUR LITTLE WORLD</span>
-              <span>
-                {readyCount} / {room.members.length} 人已准备
-              </span>
-            </div>
-            <RoundTable room={room} me={me} onMember={setSelectedMember} />
+          <div className={`${immersive ? 'session-strip' : 'table-panel'} panel`}>
+            {!immersive && (
+              <>
+                <div className="table-panel-heading">
+                  <span className="mini-label">OUR LITTLE WORLD</span>
+                  <span>
+                    {readyCount} / {room.members.length} 人已准备
+                  </span>
+                </div>
+                <RoundTable room={room} me={me} onMember={setSelectedMember} />
+              </>
+            )}
             <div className="table-bottom">
               <div>
                 <span className={`connection-dot ${connected ? '' : 'offline'}`} />
@@ -447,7 +473,14 @@ export function RoomView({
               )}
             </div>
           </div>
-          <StoryLog room={room} me={me} session={session} run={run} notify={notify} />
+          <StoryLog
+            room={room}
+            me={me}
+            session={session}
+            run={run}
+            notify={notify}
+            immersive={immersive}
+          />
         </section>
         <aside className="tools-panel panel">
           <div className="panel-heading">
@@ -888,12 +921,14 @@ function StoryLog({
   session,
   run,
   notify,
+  immersive,
 }: {
   room: Room;
   me: Member;
   session: Session;
   run: Run;
   notify: Props['notify'];
+  immersive: boolean;
 }) {
   const [message, setMessage] = useState('');
   const [imageFile, setImageFile] = useState<File | null>(null);
@@ -970,7 +1005,7 @@ function StoryLog({
   useEffect(() => {
     const element = scrollRef.current;
     if (element && atBottom.current) element.scrollTop = element.scrollHeight;
-  }, [room.log.at(-1)?.id]);
+  }, [room.log.at(-1)?.id, immersive]);
   const send = async (e: FormEvent) => {
     e.preventDefault();
     if ((!message.trim() && !imageFile) || busy || room.phase !== 'active') return;
@@ -1001,7 +1036,7 @@ function StoryLog({
     notify('已导出当前已载入的记录；完整续团请使用全局存档。');
   };
   return (
-    <div className="story-panel panel">
+    <div className="story-panel panel" id="room-story-log">
       <div className="story-heading">
         <div className="tabs">
           <button className={filter === 'all' ? 'active' : ''} onClick={() => setFilter('all')}>
