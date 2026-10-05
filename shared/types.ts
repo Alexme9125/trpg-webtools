@@ -1,3 +1,6 @@
+import type { Atlas } from './atlas';
+import type { RoomConfig } from './room-config';
+import type { ChatImage } from './media';
 import type { CreationAllocation, CreationPolicy } from './creation';
 import type { KeeperCard } from './keeper';
 import type { DndStatBlock } from './dnd';
@@ -100,6 +103,13 @@ export interface RoomEvent {
   createdAt: string;
   visibility: Visibility;
   requestId?: string;
+  image?: ChatImage;
+  scene?: { title: string; description: string };
+  imageDescription?: { name: string; description: string };
+  /** Server-only label for redacting a compound secret roll. */
+  secretLabel?: string;
+  /** Player projection; never contains real roll data. */
+  secret?: { label: string };
   roll?: DiceResult;
   check?: CheckResult;
 }
@@ -112,6 +122,10 @@ export interface Room {
   phase: 'lobby' | 'active';
   members: Member[];
   log: RoomEvent[];
+  historyComplete?: boolean;
+  historyBefore?: string;
+  /** Host-only projection. Never exported with a room archive. */
+  seatClaims?: { memberId: string; code: string }[];
   scene: { title: string; description: string };
   initiative: { memberId: string; value: number }[];
   activeTurn: number;
@@ -119,6 +133,8 @@ export interface Room {
   createdAt: string;
   creationPolicy: CreationPolicy;
   policyRevision: number;
+  configRevision: number;
+  atlases: Atlas[];
   keeperCards: KeeperCard[];
   dndCards: DndStatBlock[];
   encounter: EncounterState;
@@ -138,14 +154,20 @@ export interface CreateRoomInput {
   nickname: string;
   rule: RuleId;
   mode: RoomMode;
+  configuration?: RoomConfig;
 }
 export interface JoinRoomInput {
+  seatCode?: string;
   code: string;
   nickname: string;
   rule: RuleId;
 }
 export type RoomAction =
   | EncounterAction
+  | { type: 'atlas-save'; atlases: Atlas[] }
+  | { type: 'atlas-delete'; atlasId: string }
+  | { type: 'atlas-publish'; atlasId: string; sceneId: string }
+  | { type: 'room-config'; configuration: RoomConfig; expectedRevision: number }
   | {
       type: 'character-adjust';
       memberId: string;

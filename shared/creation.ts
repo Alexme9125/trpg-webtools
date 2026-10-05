@@ -321,6 +321,7 @@ export const CreationPolicySchema = z
     rule: z.enum(['dnd', 'coc']),
     cocSkillCap: z.number().int().min(1).max(99),
     requireAllPoints: z.boolean(),
+    allowInterestOnOccupation: z.boolean().default(true),
     allowMythos: z.boolean(),
     dndExtraSkills: z.number().int().min(0).max(18),
     dndExtraSaves: z.number().int().min(0).max(6),
@@ -343,6 +344,7 @@ export function defaultCreationPolicy(rule: RuleId): CreationPolicy {
     rule,
     cocSkillCap: 99,
     requireAllPoints: false,
+    allowInterestOnOccupation: true,
     allowMythos: false,
     dndExtraSkills: 0,
     dndExtraSaves: 0,
@@ -553,6 +555,10 @@ export function validateCreation(card: Character, policy: CreationPolicy): strin
     }
     for (const [key, value] of Object.entries(a.personal)) {
       if (!known.has(key)) errors.push('兴趣点不能用于未支持的技能');
+      if (policy.allowInterestOnOccupation === false && value > 0 && allowed.has(key))
+        errors.push(
+          `本房间兴趣点不能用于职业技能：${COC_SKILLS.find((s) => s.key === key)?.label ?? key}`,
+        );
     }
     if (!policy.allowMythos && (card.skills.cthulhuMythos ?? 0) !== 0)
       errors.push('本房间新调查员的克苏鲁神话须为 0');
@@ -717,7 +723,13 @@ export function suggestAllocation(card: Character, policy: CreationPolicy): Char
     remaining = distribute(a.occupational, a.occupationSkills, remaining);
     // A tight room cap can intentionally leave points unspent; validation explains it.
     void remaining;
-    distribute(a.personal, allCoc, budget.personal);
+    distribute(
+      a.personal,
+      policy.allowInterestOnOccupation === false
+        ? allCoc.filter((key) => !a.occupationSkills.includes(key))
+        : allCoc,
+      budget.personal,
+    );
   }
   return syncAllocation(result);
 }

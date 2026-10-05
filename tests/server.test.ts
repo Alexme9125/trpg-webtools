@@ -291,7 +291,7 @@ describe('真实多人房间服务', () => {
     ).toBe(true);
   });
 
-  it('主持人暗骰不会广播给玩家，重连后的日志仍经过过滤', async () => {
+  it('主持人暗骰广播遮罩行为，重连后的结果仍被隐藏', async () => {
     const { url } = await setup();
     const host = await client(url),
       player = await client(url);
@@ -299,7 +299,11 @@ describe('真实多人房间服务', () => {
       p = await joinRoom(player, h.room.code);
     const observed = nextState(player);
     await action(host, { type: 'roll', expression: '1d20+2', visibility: 'host' });
-    expect((await observed).log.some((e) => e.type === 'roll')).toBe(false);
+    expect((await observed).log.at(-1)).toMatchObject({
+      type: 'roll',
+      secret: { label: '1d20+2' },
+      content: '1d20+2 = ？ · 结果 ？',
+    });
     expect(
       (await ack(player, 'room:action', { type: 'roll', expression: '1d6', visibility: 'host' }))
         .ok,
@@ -310,9 +314,9 @@ describe('真实多人房间服务', () => {
     const restoredPlayer = await client(url);
     expect(
       (await success<RoomConnection>(restoredPlayer, 'room:resume', p.session)).room.log.some(
-        (e) => e.type === 'roll',
+        (e) => e.type === 'roll' && !!e.secret && !e.roll,
       ),
-    ).toBe(false);
+    ).toBe(true);
     const badClient = await client(url);
     expect((await ack(badClient, 'room:resume', { ...h.session, token: '0'.repeat(64) })).ok).toBe(
       false,
@@ -476,7 +480,7 @@ describe('真实多人房间服务', () => {
     const resumedPlayer = await client(second.url);
     expect(
       (await success<RoomConnection>(resumedPlayer, 'room:resume', p.session)).room.log.every(
-        (e) => e.visibility === 'public',
+        (e) => e.visibility === 'public' || (!!e.secret && !e.roll && !e.check),
       ),
     ).toBe(true);
     const persisted = JSON.parse(readFileSync(join(first.dataDir, 'rooms.json'), 'utf8'));

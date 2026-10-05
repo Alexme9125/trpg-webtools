@@ -1,3 +1,4 @@
+import { AtlasToolkit } from './AtlasToolkit';
 import { useEffect, useRef, useState } from 'react';
 import {
   ArrowRight,
@@ -34,7 +35,7 @@ export function HostToolkit({
   notify: (message: string, type?: 'success' | 'error') => void;
 }) {
   const [cards, setCards] = useState<KeeperCard[]>([]);
-  const [libraryRule, setLibraryRule] = useState<'coc' | 'dnd'>(room?.rule ?? 'coc');
+  const [libraryRule, setLibraryRule] = useState<'coc' | 'dnd' | 'atlas'>(room?.rule ?? 'coc');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [workshop, setWorkshop] = useState<{
@@ -109,7 +110,7 @@ export function HostToolkit({
         <div>
           <span className="mini-label">BEHIND THE SCREEN</span>
           <h1>主持人工具集</h1>
-          <p>在故事开始前，准备那些即将相遇的面孔。</p>
+          <p>整理角色、地点与场景，为下一次开团做好准备。</p>
         </div>
         <span className="toolkit-private">
           <EyeOff size={16} />
@@ -129,8 +130,16 @@ export function HostToolkit({
         >
           D&D 5e · 2014
         </button>
+        <button
+          className={libraryRule === 'atlas' ? 'selected' : ''}
+          onClick={() => setLibraryRule('atlas')}
+        >
+          地图与场景
+        </button>
       </div>
-      {libraryRule === 'dnd' ? (
+      {libraryRule === 'atlas' ? (
+        <AtlasToolkit room={room} isHost={isHost} onAction={onAction} />
+      ) : libraryRule === 'dnd' ? (
         <DndToolkit
           room={room}
           isHost={isHost}

@@ -539,7 +539,11 @@ describe('authoritative encounter and private D&D library', () => {
     expect(room.encounter.participants.map((c) => c.hp)).toEqual(
       before.encounter.participants.map((c) => c.hp),
     );
-    expect((await snapshot(player, p.session)).log.some((e) => e.id === result.id)).toBe(false);
+    expect((await snapshot(player, p.session)).log.find((e) => e.id === result.id)).toMatchObject({
+      type: 'check',
+      secret: { label: '近战对抗' },
+      content: '近战对抗 = ？ · 结果 ？',
+    });
     await action(host, { ...duel, visibility: 'public' });
     room = await snapshot(player, p.session);
     expect(room.log.at(-1)!.content).toContain('不自动扣除 HP');
